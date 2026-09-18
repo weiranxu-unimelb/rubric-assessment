@@ -1,0 +1,46 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: rubric
+      POSTGRES_USER: rubric
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rubric -d rubric"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://rubric:${POSTGRES_PASSWORD}@db:5432/rubric
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+  setup:
+    build:
+      context: .
+      target: builder
+    profiles: ["setup"]
+    environment:
+      DATABASE_URL: postgres://rubric:${POSTGRES_PASSWORD}@db:5432/rubric
+      BOOTSTRAP_SUPER_ADMIN_NO: ${BOOTSTRAP_SUPER_ADMIN_NO:?请设置超级管理员工号}
+      BOOTSTRAP_SUPER_ADMIN_PASSWORD: ${BOOTSTRAP_SUPER_ADMIN_PASSWORD:?请设置超级管理员密码}
+      BOOTSTRAP_SUPER_ADMIN_NAME: ${BOOTSTRAP_SUPER_ADMIN_NAME:-系统管理员}
+      BOOTSTRAP_COMPANY_NAME: ${BOOTSTRAP_COMPANY_NAME:-示例企业}
+      BOOTSTRAP_SUBSIDIARY_NAME: ${BOOTSTRAP_SUBSIDIARY_NAME:-总部}
+    command: sh -c "npm run db:migrate && npm run db:seed"
+    depends_on:
+      db:
+        condition: service_healthy
+volumes:
+  postgres_data:

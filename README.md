@@ -1,2 +1,48 @@
-# rubric-assessment
-Small and simple project for assessing each member in an organization.
+# 衡标 · 员工考核系统
+
+基于 [需求规格说明](./SPEC-employee-assessment.md) 的本地可运行版本。员工用工号登录；管理员配置树状指标、打分人并审核填报；多名打分人独立评分；超级管理员管理企业和授权、查看打分明细。
+
+## 技术与运行要求
+
+- Node.js 22+、Next.js 16、React 19、PostgreSQL 16、Drizzle ORM、ExcelJS。
+- 单台服务器可用 Docker Compose 运行应用和数据库；数据库数据保存在命名卷。
+- 浏览器桌面/手机均可访问。建议正式环境使用 HTTPS 反向代理，并将 `SESSION_COOKIE_SECURE=true`。
+
+## 最快启动：Docker Compose
+
+1. 复制 `.env.example` 为 `.env`，设置两个**不同的强密码**：`POSTGRES_PASSWORD` 与 `BOOTSTRAP_SUPER_ADMIN_PASSWORD`。本地开发时 `DATABASE_URL` 中的数据库密码也要与 `POSTGRES_PASSWORD` 一致。
+2. 运行 `docker compose --profile setup run --rm setup`，完成数据库迁移与首次超级管理员初始化。此命令可重复运行，不会覆盖已有超级管理员。
+3. 运行 `docker compose up -d --build app`。
+4. 打开 `http://localhost:3000`，使用 `.env` 中的超级管理员工号和密码登录。
+
+如果本机没有 Docker，也可以自行准备 PostgreSQL 16，再执行 `npm ci`、`npm run db:migrate`、`npm run db:seed`、`npm run dev`。生产启动使用 `npm run build && npm run start`。
+
+> 当前开发环境没有可运行的 Docker 守护进程，因此仓库的容器配置已准备，但尚未在此机器完成容器实际启动验收。
+
+## 首次使用顺序
+
+1. 超级管理员在“超级管理员”界面创建企业、子公司、考核周期。
+2. 在“管理员”界面新增员工，或下载模板后导入员工 Excel；初始密码至少 10 位，建议首次登录立即修改。
+3. 超级管理员在“管理员授权”中给员工授予一个或多个子公司的管理权限；管理员同时保留员工身份。
+4. 管理员选择草稿周期，为每名在职员工（包括管理员和超级管理员）设置指标树与打分人；同一员工可配置多名打分人。指标、打分关系均可下载模板后批量导入。
+5. 超级管理员发布周期。员工填报并提交；管理员审核通过或逐条给意见退回。
+6. 审核通过后打分任务才生成。所有打分人提交后计算平均总分；管理员仅能看到打分进度和最终总分，不能看到打分细项。全部完成后才可导出总分 Excel；超级管理员可随时导出明细。
+
+## 校验与测试
+
+```sh
+npm run typecheck
+npm test
+npm run lint
+npm run build
+```
+
+关键并发操作使用数据库事务、行锁、版本号和幂等键。修改同一张考核单或同一打分任务时，旧版本会返回 HTTP 409。
+
+## 已知限制与生产前注意事项
+
+- “催办”当前仅写入审计记录，不发送站内消息、短信或企业微信通知。
+- Excel 员工与打分关系导入先预校验、再确认，默认整份文件原子写入；当前限制为单次 500 行、2 MB。初始密码存放于员工导入文件，请在导入后安全删除该文件。
+- 当前最终得分是所有打分人 100 分制总分的等权平均，不支持评分人权重。
+- 当前版本尚未实现 Spec 中的模板库、附件、PWA 离线草稿、周期结束/归档、完整审计查询、站内催办通知、后台队列、OSS 存储、Caddy 自动 HTTPS 和电子表格导入错误文件。UI 使用轻量自有 CSS 而非 Tailwind/shadcn，密码使用 Node 内置 scrypt 而非 Argon2id。这些是后续开发项，不应将此版本视为 Spec 全量交付。
+- 部署到公网前应配置 HTTPS、备份 PostgreSQL 数据卷、限制管理员账号分发，并增加登录限速及操作审计查看页面。当前版本适合本地试用/内网验收，不建议未经加固直接公开到互联网。
