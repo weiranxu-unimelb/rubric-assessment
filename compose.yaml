@@ -20,6 +20,7 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: postgres://rubric:${POSTGRES_PASSWORD}@db:5432/rubric
+      APP_ORIGIN: ${APP_ORIGIN:?请在 .env 中设置 APP_ORIGIN}
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
     ports:
       - "${APP_PORT:-3000}:3000"

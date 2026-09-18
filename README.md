@@ -6,11 +6,11 @@
 
 - Node.js 22+、Next.js 16、React 19、PostgreSQL 16、Drizzle ORM、ExcelJS。
 - 单台服务器可用 Docker Compose 运行应用和数据库；数据库数据保存在命名卷。
-- 浏览器桌面/手机均可访问。建议正式环境使用 HTTPS 反向代理，并将 `SESSION_COOKIE_SECURE=true`。
+- 浏览器桌面/手机均可访问。`APP_ORIGIN` 必须设为浏览器实际访问的地址（协议、域名和端口）；正式环境使用 HTTPS 反向代理时，设为 `https://你的域名`，并将 `SESSION_COOKIE_SECURE=true`。
 
 ## 最快启动：Docker Compose
 
-1. 复制 `.env.example` 为 `.env`，设置两个**不同的强密码**：`POSTGRES_PASSWORD` 与 `BOOTSTRAP_SUPER_ADMIN_PASSWORD`。本地开发时 `DATABASE_URL` 中的数据库密码也要与 `POSTGRES_PASSWORD` 一致。
+1. 复制 `.env.example` 为 `.env`，设置两个**不同的强密码**：`POSTGRES_PASSWORD` 与 `BOOTSTRAP_SUPER_ADMIN_PASSWORD`。本地开发时 `DATABASE_URL` 中的数据库密码也要与 `POSTGRES_PASSWORD` 一致；从 `localhost:3000` 访问时保留 `APP_ORIGIN=http://localhost:3000`。
 2. 运行 `docker compose --profile setup run --rm setup`，完成数据库迁移与首次超级管理员初始化。此命令可重复运行，不会覆盖已有超级管理员。
 3. 运行 `docker compose up -d --build app`。
 4. 打开 `http://localhost:3000`，使用 `.env` 中的超级管理员工号和密码登录。
@@ -22,6 +22,7 @@
 ## 首次使用顺序
 
 1. 超级管理员在“超级管理员”界面创建企业、子公司、考核周期。
+   该界面也可查看、改名企业和子公司，并停用/启用子公司。子公司名称在全系统内不允许新增重名（忽略大小写及首尾空格）；升级前已有的重名记录不会自动合并，请在组织列表中逐条改名。
 2. 在“管理员”界面新增员工，或下载模板后导入员工 Excel；初始密码至少 10 位，建议首次登录立即修改。
 3. 超级管理员在“管理员授权”中给员工授予一个或多个子公司的管理权限；管理员同时保留员工身份。
 4. 管理员选择草稿周期，为每名在职员工（包括管理员和超级管理员）设置指标树与打分人；同一员工可配置多名打分人。指标、打分关系均可下载模板后批量导入。

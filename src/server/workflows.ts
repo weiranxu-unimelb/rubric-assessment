@@ -15,6 +15,7 @@ export type NewIndicator = {
   parentCode: string | null;
   name: string;
   description: string;
+  scoringRule: string;
   maxScore: number;
   sortOrder: number;
 };
@@ -105,8 +106,8 @@ export async function configureAssessment(actor: Actor, input: { cycleId: string
     }
     const idByCode = new Map(input.nodes.map((node) => [node.nodeCode, randomUUID()]));
     for (const node of input.nodes) {
-      await client.query("insert into indicator_nodes (id,assessment_id,parent_id,node_code,name,description,max_score,sort_order) values ($1,$2,$3,$4,$5,$6,$7,$8)",
-        [idByCode.get(node.nodeCode), id, node.parentCode ? idByCode.get(node.parentCode) : null, node.nodeCode, node.name, node.description, node.maxScore, node.sortOrder]);
+      await client.query("insert into indicator_nodes (id,assessment_id,parent_id,node_code,name,description,scoring_rule,max_score,sort_order) values ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        [idByCode.get(node.nodeCode), id, node.parentCode ? idByCode.get(node.parentCode) : null, node.nodeCode, node.name, node.description, node.scoringRule, node.maxScore, node.sortOrder]);
     }
     for (const scorerNo of input.scorers) {
       await client.query("insert into scorer_assignments (id,cycle_id,employee_no,scorer_employee_no) values ($1,$2,$3,$4)", [randomUUID(), input.cycleId, input.employeeNo, scorerNo]);

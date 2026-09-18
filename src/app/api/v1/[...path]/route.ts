@@ -5,7 +5,9 @@ import ExcelJS from "exceljs";
 import { createSession, destroySession, getActor, hashPassword, mayAdmin, verifyPassword, type Actor } from "@/server/auth";
 import { pool } from "@/server/db";
 import { loadState } from "@/server/state";
+import { isAllowedOrigin } from "@/server/origin";
 import { approveAssessment, configureAssessment, HttpError, publishCycle, returnAssessment, saveScore, saveSelf, submitScore, submitSelf } from "@/server/workflows";
+import { buildIndicatorNodes, validateIndicatorHierarchy, type IndicatorGroupDraft } from "@/lib/indicator-hierarchy";
 
 export const runtime = "nodejs";
 const text = z.string().trim().min(1).max(200);
@@ -13,13 +15,14 @@ const id = z.string().uuid();
 const employeeNo = z.string().trim().min(1).max(40);
 const newPassword = z.string().min(10).max(128).regex(/^(?=.*[A-Za-z])(?=.*\d).+$/, "密码需同时包含字母和数字");
 const score = z.number().finite().min(0).max(100);
-const node = z.object({ nodeCode: text, parentCode: text.nullable(), name: text, description: z.string().max(2000).default(""), maxScore: score, sortOrder: z.number().int().default(0) });
-const employeeImportRow = z.object({ employeeNo, name: text, subsidiaryName: text, position: z.string().max(200), phone: z.string().max(40), initialPassword: newPassword });
+const node = z.object({ nodeCode: text, parentCode: text.nullable(), name: text, description: z.string().max(2000).default(""), scoringRule: z.string().max(2000).default(""), maxScore: score, sortOrder: z.number().int().default(0) });
+const employeeImportRow = z.object({ employeeNo, name: text, subsidiaryName: text, department: text, position: z.string().max(200), phone: z.string().max(40), initialPassword: newPassword });
 
 function response(data: unknown, status = 200) { return NextResponse.json(data, { status }); }
 function failure(error: unknown) {
   if (error instanceof HttpError) return response({ error: { code: error.code, message: error.message } }, error.status);
   if (error instanceof z.ZodError) return response({ error: { code: "VALIDATION", message: error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("；") } }, 422);
+  if (error && typeof error === "object" && "code" in error && error.code === "23505" && "constraint" in error && error.constraint === "subsidiaries_name_unique") return response({ error: { code: "DUPLICATE_SUBSIDIARY", message: "子公司名称已存在" } }, 409);
   if (error && typeof error === "object" && "code" in error && error.code === "23505") return response({ error: { code: "DUPLICATE", message: "工号或名称已存在，请检查后重试" } }, 409);
   if (error && typeof error === "object" && "code" in error && error.code === "23503") return response({ error: { code: "INVALID_REFERENCE", message: "引用的员工、企业或子公司不存在" } }, 422);
   console.error(error);
@@ -27,8 +30,8 @@ function failure(error: unknown) {
 }
 async function body(req: NextRequest) { return await req.json().catch(() => { throw new HttpError(400, "INVALID_JSON", "请求体不是有效 JSON"); }); }
 function guardOrigin(req: NextRequest) {
-  const origin = req.headers.get("origin");
-  if (origin && origin !== req.nextUrl.origin) throw new HttpError(403, "ORIGIN", "禁止跨站请求");
+  if (!process.env.APP_ORIGIN) throw new HttpError(500, "APP_ORIGIN_NOT_CONFIGURED", "服务未配置对外访问地址");
+  if (!isAllowedOrigin(req.headers.get("origin"), process.env.APP_ORIGIN)) throw new HttpError(403, "ORIGIN", "禁止跨站请求");
 }
 async function actorRequired(): Promise<Actor> {
   const actor = await getActor();
@@ -43,11 +46,11 @@ async function companyForSubsidiary(subsidiaryId: string) {
   return result.rows[0].company_id as string;
 }
 async function createEmployee(actor: Actor, value: unknown) {
-  const data = z.object({ employeeNo, subsidiaryId: id, name: text, position: z.string().max(200).default(""), phone: z.string().max(40).default(""), initialPassword: newPassword }).parse(value);
+  const data = z.object({ employeeNo, subsidiaryId: id, name: text, department: text, position: z.string().max(200).default(""), phone: z.string().max(40).default(""), initialPassword: newPassword }).parse(value);
   if (!mayAdmin(actor, data.subsidiaryId)) throw new HttpError(403, "FORBIDDEN", "无权管理该子公司");
   await companyForSubsidiary(data.subsidiaryId);
   const passwordHash = await hashPassword(data.initialPassword);
-  await pool.query("insert into employees (employee_no,subsidiary_id,name,position,phone,password_hash) values ($1,$2,$3,$4,$5,$6)", [data.employeeNo, data.subsidiaryId, data.name, data.position, data.phone, passwordHash]);
+  await pool.query("insert into employees (employee_no,subsidiary_id,name,department,position,phone,password_hash) values ($1,$2,$3,$4,$5,$6,$7)", [data.employeeNo, data.subsidiaryId, data.name, data.department, data.position, data.phone, passwordHash]);
   return { employeeNo: data.employeeNo };
 }
 async function excelResponse(rows: (string | number | null)[][], name: string) {
@@ -67,24 +70,24 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ path: strin
     if (path === "state") return response(await loadState(actor));
     if (path === "templates/employees" || path === "templates/indicators" || path === "templates/scorers") {
       adminRequired(actor);
-      if (path === "templates/employees") return excelResponse([["工号", "姓名", "子公司名称", "岗位", "手机号", "初始密码"], ["E1001", "张三", "请填子公司名称", "员工", "", "至少10位密码"]], "员工导入模板");
-      if (path === "templates/indicators") return excelResponse([["指标编码", "父指标编码", "名称", "描述", "分值", "排序"], ["R", "", "考核总分", "", 100, 1], ["A", "R", "工作业绩", "", 60, 1], ["A1", "A", "目标完成", "", 60, 1], ["B", "R", "工作能力", "", 40, 2]], "指标导入模板");
+      if (path === "templates/employees") return excelResponse([["工号", "姓名", "公司名称", "部门", "职位", "手机号", "初始密码"], ["E1001", "张三", "请填公司名称", "人力资源部", "人事专员", "", "至少10位密码"]], "员工导入模板");
+      if (path === "templates/indicators") return excelResponse([["一级指标", "一级考核内容", "一级计分规则", "一级分值", "二级指标", "二级考核内容", "二级计分规则", "二级分值"], ["人力资源基础业务规范开展", "完成基础人力资源工作", "按完成质量与时效评分", 25, "", "", "", ""], ["人才引进及任务服务支持", "完成招聘及服务支持", "按任务完成情况评分", 30, "", "", "", ""], ["岗位绩效考核协同及业务能力提升", "协同完成考核工作", "按协同质量评分", 45, "招聘计划执行", "完成招聘计划", "按招聘达成率评分", 25], ["岗位绩效考核协同及业务能力提升", "", "", 45, "考核协同", "完成绩效协同", "按协同及时性评分", 20]], "指标导入模板");
       return excelResponse([["被打分人工号", "打分人工号"], ["E1001", "E1002"], ["E1001", "E1003"]], "打分人关系模板");
     }
     if (path === "export/employees" || path === "export/scorers" || path === "export/indicators") {
       adminRequired(actor);
       const scope = actor.isSuperAdmin ? null : actor.adminSubsidiaryIds;
       if (path === "export/employees") {
-        const result = await pool.query(`select e.employee_no,e.name,s.name as subsidiary_name,e.position,e.phone,e.status from employees e join subsidiaries s on s.id=e.subsidiary_id where $1::text[] is null or e.subsidiary_id=any($1::text[]) order by s.name,e.name`, [scope]);
-        return excelResponse([["工号", "姓名", "子公司", "岗位", "手机号", "状态"], ...result.rows.map((r) => [r.employee_no, r.name, r.subsidiary_name, r.position, r.phone, r.status])], "员工名单");
+        const result = await pool.query(`select e.employee_no,e.name,s.name as subsidiary_name,e.department,e.position,e.phone,e.status from employees e join subsidiaries s on s.id=e.subsidiary_id where $1::text[] is null or e.subsidiary_id=any($1::text[]) order by s.name,e.department,e.name`, [scope]);
+        return excelResponse([["工号", "姓名", "公司", "部门", "职位", "手机号", "状态"], ...result.rows.map((r) => [r.employee_no, r.name, r.subsidiary_name, r.department, r.position, r.phone, r.status])], "员工名单");
       }
       const cycleId = id.parse(req.nextUrl.searchParams.get("cycleId"));
       if (path === "export/scorers") {
         const result = await pool.query(`select sa.employee_no,sa.scorer_employee_no,sa.status from scorer_assignments sa join employees e on e.employee_no=sa.employee_no where sa.cycle_id=$1 and ($2::text[] is null or e.subsidiary_id=any($2::text[])) order by sa.employee_no,sa.scorer_employee_no`, [cycleId, scope]);
         return excelResponse([["被打分人工号", "打分人工号", "状态"], ...result.rows.map((r) => [r.employee_no, r.scorer_employee_no, r.status])], "打分人关系");
       }
-      const result = await pool.query(`select a.employee_no,n.node_code,p.node_code as parent_code,n.name,n.description,n.max_score,n.sort_order from indicator_nodes n join assessments a on a.id=n.assessment_id join employees e on e.employee_no=a.employee_no left join indicator_nodes p on p.id=n.parent_id where a.cycle_id=$1 and ($2::text[] is null or e.subsidiary_id=any($2::text[])) order by a.employee_no,n.sort_order`, [cycleId, scope]);
-      return excelResponse([["工号", "指标编码", "父指标编码", "名称", "描述", "分值", "排序"], ...result.rows.map((r) => [r.employee_no, r.node_code, r.parent_code, r.name, r.description, Number(r.max_score), r.sort_order])], "指标配置");
+      const result = await pool.query(`select a.employee_no,n.node_code,p.node_code as parent_code,n.name,n.description,n.scoring_rule,n.max_score,n.sort_order from indicator_nodes n join assessments a on a.id=n.assessment_id join employees e on e.employee_no=a.employee_no left join indicator_nodes p on p.id=n.parent_id where a.cycle_id=$1 and ($2::text[] is null or e.subsidiary_id=any($2::text[])) order by a.employee_no,n.sort_order`, [cycleId, scope]);
+      return excelResponse([["工号", "指标编码", "父指标编码", "名称", "考核内容", "计分规则", "分值", "排序"], ...result.rows.map((r) => [r.employee_no, r.node_code, r.parent_code, r.name, r.description, r.scoring_rule, Number(r.max_score), r.sort_order])], "指标配置");
     }
     if (path === "export/final" || path === "export/detail") {
       const cycleId = id.parse(req.nextUrl.searchParams.get("cycleId"));
@@ -147,6 +150,8 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
     if (path === "subsidiaries") {
       superRequired(actor);
       const data = z.object({ companyId: id, name: text }).parse(await body(req));
+      const existing = await pool.query("select id from subsidiaries where lower(btrim(name))=lower($1) limit 1", [data.name]);
+      if (existing.rows.length) throw new HttpError(409, "DUPLICATE_SUBSIDIARY", "子公司名称已存在");
       const newId = randomUUID();
       await pool.query("insert into subsidiaries (id,company_id,name) values ($1,$2,$3)", [newId, data.companyId, data.name]);
       return response({ id: newId }, 201);
@@ -188,7 +193,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
         const row = sheet.getRow(rowIndex);
         const cell = (n: number) => String(row.getCell(n).text ?? "").trim();
         if (!cell(1)) continue;
-        const parsed = employeeImportRow.safeParse({ employeeNo: cell(1), name: cell(2), subsidiaryName: cell(3), position: cell(4), phone: cell(5), initialPassword: cell(6) });
+        const parsed = employeeImportRow.safeParse({ employeeNo: cell(1), name: cell(2), subsidiaryName: cell(3), department: cell(4), position: cell(5), phone: cell(6), initialPassword: cell(7) });
         if (!parsed.success) { errors.push(`第 ${rowIndex} 行：${parsed.error.issues.map((issue) => issue.path.join(".")).join("、")}无效`); continue; }
         if (seen.has(parsed.data.employeeNo)) { errors.push(`第 ${rowIndex} 行：工号在文件中重复`); continue; }
         seen.add(parsed.data.employeeNo);
@@ -209,7 +214,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
         await client.query("begin");
         for (let i = 0; i < rows.length; i++) {
           const row = rows[i];
-          await client.query("insert into employees (employee_no,subsidiary_id,name,position,phone,password_hash) values ($1,$2,$3,$4,$5,$6)", [row.employeeNo, row.subsidiaryId, row.name, row.position, row.phone, hashes[i]]);
+          await client.query("insert into employees (employee_no,subsidiary_id,name,department,position,phone,password_hash) values ($1,$2,$3,$4,$5,$6,$7)", [row.employeeNo, row.subsidiaryId, row.name, row.department, row.position, row.phone, hashes[i]]);
         }
         await client.query("commit");
       } catch (error) { await client.query("rollback"); throw error; }
@@ -228,11 +233,35 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
       await workbook.xlsx.load(Buffer.from(await file.arrayBuffer()) as never);
       const sheet = workbook.worksheets[0];
       if (!sheet || sheet.rowCount > 301) throw new HttpError(422, "FILE", "单次最多导入 300 个指标节点");
+      const header = String(sheet.getRow(1).getCell(1).text ?? "").trim();
       const nodes = [];
-      for (let i = 2; i <= sheet.rowCount; i++) {
-        const row = sheet.getRow(i); const cell = (n: number) => String(row.getCell(n).text ?? "").trim();
-        if (!cell(1)) continue;
-        nodes.push(node.parse({ nodeCode: cell(1), parentCode: cell(2) || null, name: cell(3), description: cell(4), maxScore: Number(cell(5)), sortOrder: Number(cell(6) || i) }));
+      if (header === "指标编码") {
+        for (let i = 2; i <= sheet.rowCount; i++) {
+          const row = sheet.getRow(i); const cell = (n: number) => String(row.getCell(n).text ?? "").trim();
+          if (!cell(1)) continue;
+          nodes.push(node.parse({ nodeCode: cell(1), parentCode: cell(2) || null, name: cell(3), description: cell(4), scoringRule: "", maxScore: Number(cell(5)), sortOrder: Number(cell(6) || i) }));
+        }
+      } else if (header === "一级指标") {
+        const groups: IndicatorGroupDraft[] = [];
+        const groupsByName = new Map<string, IndicatorGroupDraft>();
+        for (let i = 2; i <= sheet.rowCount; i++) {
+          const row = sheet.getRow(i); const cell = (n: number) => String(row.getCell(n).text ?? "").trim();
+          if (!cell(1)) continue;
+          const name = cell(1); const maxScore = cell(4);
+          let group = groupsByName.get(name);
+          if (!group) {
+            group = { name, description: cell(2), scoringRule: cell(3), maxScore, children: [] };
+            groupsByName.set(name, group); groups.push(group);
+          } else if (group.maxScore !== maxScore) {
+            throw new HttpError(422, "INVALID_TEMPLATE", `第 ${i} 行：同名一级指标的分值必须一致`);
+          }
+          if (cell(5)) group.children.push({ name: cell(5), description: cell(6), scoringRule: cell(7), maxScore: cell(8) });
+        }
+        const errors = validateIndicatorHierarchy(groups);
+        if (errors.length) throw new HttpError(422, "INVALID_TREE", errors.join("；"));
+        nodes.push(...buildIndicatorNodes(groups));
+      } else {
+        throw new HttpError(422, "INVALID_TEMPLATE", "指标模板表头应为“一级指标”，请下载最新模板后导入");
       }
       return response(await configureAssessment(actor, { cycleId, employeeNo: targetNo, nodes, scorers }));
     }
@@ -307,6 +336,33 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ path: str
   try {
     guardOrigin(req);
     const actor = await actorRequired(); const path = (await ctx.params).path.join("/");
+    const company = path.match(/^companies\/([^/]+)$/);
+    if (company) {
+      superRequired(actor);
+      const companyId = id.parse(company[1]);
+      const data = z.object({ name: text }).parse(await body(req));
+      const result = await pool.query("update companies set name=$2 where id=$1 returning id", [companyId, data.name]);
+      if (!result.rows.length) throw new HttpError(404, "NOT_FOUND", "企业不存在");
+      return response({ ok: true });
+    }
+    const subsidiary = path.match(/^subsidiaries\/([^/]+)$/);
+    if (subsidiary) {
+      superRequired(actor);
+      const subsidiaryId = id.parse(subsidiary[1]);
+      const data = z.object({ name: text.optional(), status: z.enum(["ACTIVE", "INACTIVE"]).optional() })
+        .refine((value) => value.name !== undefined || value.status !== undefined, "请提供名称或状态").parse(await body(req));
+      if (data.name !== undefined) {
+        const existing = await pool.query("select id from subsidiaries where lower(btrim(name))=lower($1) and id<>$2 limit 1", [data.name, subsidiaryId]);
+        if (existing.rows.length) throw new HttpError(409, "DUPLICATE_SUBSIDIARY", "子公司名称已存在");
+      }
+      if (data.status === "INACTIVE") {
+        const active = await pool.query("select c.id from cycles c join subsidiaries s on s.company_id=c.company_id where s.id=$1 and c.status='ACTIVE' limit 1", [subsidiaryId]);
+        if (active.rows.length) throw new HttpError(409, "ACTIVE_CYCLE", "该子公司所属企业有进行中的考核周期，暂不能停用");
+      }
+      const result = await pool.query("update subsidiaries set name=coalesce($2,name),status=coalesce($3,status) where id=$1 returning id", [subsidiaryId, data.name ?? null, data.status ?? null]);
+      if (!result.rows.length) throw new HttpError(404, "NOT_FOUND", "子公司不存在");
+      return response({ ok: true });
+    }
     const self = path.match(/^my\/assessments\/([^/]+)$/);
     if (self) {
       const data = z.object({ version: z.number().int().positive(), values: z.array(z.object({ nodeId: id, content: z.string().max(4000) })).max(300) }).parse(await body(req));

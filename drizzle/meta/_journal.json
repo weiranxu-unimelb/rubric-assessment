@@ -8,6 +8,20 @@
       "when": 1789713697325,
       "tag": "0000_lethal_the_hood",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1789730000000,
+      "tag": "0001_subsidiary_name_guard",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789732000000,
+      "tag": "0002_employee_department_and_scoring_rule",
+      "breakpoints": true
     }
   ]
 }
