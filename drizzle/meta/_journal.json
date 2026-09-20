@@ -64,6 +64,13 @@
       "when": 1789738000000,
       "tag": "0008_backfill_template_assessments",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1789739000000,
+      "tag": "0009_template_company_scope",
+      "breakpoints": true
     }
   ]
 }

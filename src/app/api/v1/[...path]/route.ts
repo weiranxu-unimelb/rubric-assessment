@@ -3,7 +3,7 @@ import type { PoolClient } from "pg";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import ExcelJS from "exceljs";
-import { createSession, destroySession, getActor, hashPassword, mayAdmin, verifyPassword, type Actor } from "@/server/auth";
+import { createSession, destroySession, getActor, hashPassword, mayAdmin, revokeAllSessions, verifyPassword, type Actor } from "@/server/auth";
 import { pool } from "@/server/db";
 import { loadState } from "@/server/state";
 import { isAllowedOrigin } from "@/server/origin";
@@ -12,6 +12,8 @@ import { buildIndicatorNodes, validateIndicatorHierarchy, type IndicatorGroupDra
 
 export const runtime = "nodejs";
 const text = z.string().trim().min(1).max(200);
+const cycleDate = z.string().datetime({ offset: true }).nullable().optional();
+const cycleInput = z.object({ name: text, startsAt: cycleDate, endsAt: cycleDate }).refine((value) => !value.startsAt || !value.endsAt || new Date(value.startsAt) <= new Date(value.endsAt), "结束时间不得早于开始时间");
 // 早期版本使用 32 位十六进制 ID；新版本使用标准 UUID。两者都已落库，接口需兼容。
 const id = z.string().regex(/^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i, "标识格式无效");
 const employeeNo = z.string().trim().min(1).max(40);
@@ -76,6 +78,12 @@ async function companyForSubsidiary(subsidiaryId: string) {
   const result = await pool.query("select company_id from subsidiaries where id=$1", [subsidiaryId]);
   if (!result.rows[0]) throw new HttpError(404, "NOT_FOUND", "子公司不存在");
   return result.rows[0].company_id as string;
+}
+async function mayManageCompany(actor: Actor, companyId: string) {
+  if (actor.isSuperAdmin) return true;
+  if (!actor.adminSubsidiaryIds.length) return false;
+  const result = await pool.query("select 1 from subsidiaries where company_id=$1 and id=any($2::text[]) limit 1", [companyId, actor.adminSubsidiaryIds]);
+  return result.rows.length > 0;
 }
 async function createEmployee(actor: Actor, value: unknown) {
   const data = z.object({ employeeNo, subsidiaryId: id, name: text, department: text, position: z.string().max(200).default(""), phone: z.string().max(40).default(""), initialPassword: newPassword }).parse(value);
@@ -186,7 +194,8 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
       const current = await pool.query("select password_hash from employees where employee_no=$1", [actor.employeeNo]);
       if (!current.rows[0] || !(await verifyPassword(data.currentPassword, current.rows[0].password_hash))) throw new HttpError(403, "PASSWORD", "当前密码错误");
       await pool.query("update employees set password_hash=$2 where employee_no=$1", [actor.employeeNo, await hashPassword(data.newPassword)]);
-      await destroySession();
+      await revokeAllSessions(actor.employeeNo);
+      await createSession(actor.employeeNo);
       return response({ ok: true });
     }
     if (path === "companies") {
@@ -207,17 +216,19 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
     }
     if (path === "cycles") {
       superRequired(actor);
-      const data = z.object({ name: text }).parse(await body(req));
+      const data = cycleInput.parse(await body(req));
       const newId = randomUUID();
-      await pool.query("insert into cycles (id,name) values ($1,$2)", [newId, data.name]);
+      await pool.query("insert into cycles (id,name,starts_at,ends_at) values ($1,$2,$3,$4)", [newId, data.name, data.startsAt ?? null, data.endsAt ?? null]);
       return response({ id: newId }, 201);
     }
     if (path === "employees") { adminRequired(actor); return response(await createEmployee(actor, await body(req)), 201); }
     if (path === "templates") {
       adminRequired(actor);
-      const data = z.object({ name: text, layout: templateLayout }).parse(await body(req));
+      const data = z.object({ name: text, layout: templateLayout, companyId: id.optional() }).parse(await body(req));
+      const companyId = data.companyId ?? await companyForSubsidiary(actor.subsidiaryId);
+      if (!(await mayManageCompany(actor, companyId))) throw new HttpError(403, "FORBIDDEN", "无权在该企业创建指标模板");
       const templateId = randomUUID(); const client = await pool.connect();
-      try { await client.query("begin"); await client.query("insert into indicator_templates (id,name,layout,created_by) values ($1,$2,$3,$4)", [templateId, data.name, JSON.stringify(data.layout), actor.employeeNo]); await client.query("commit"); } catch (error) { await client.query("rollback"); throw error; } finally { client.release(); }
+      try { await client.query("begin"); await client.query("insert into indicator_templates (id,company_id,name,layout,created_by) values ($1,$2,$3,$4,$5)", [templateId, companyId, data.name, JSON.stringify(data.layout), actor.employeeNo]); await client.query("commit"); } catch (error) { await client.query("rollback"); throw error; } finally { client.release(); }
       return response({ id: templateId }, 201);
     }
     const templateMatch = path.match(/^templates\/([^/]+)$/);
@@ -225,8 +236,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
       adminRequired(actor);
       const templateId = id.parse(templateMatch[1]);
       const data = z.object({ name: text, layout: templateLayout }).parse(await body(req));
-      const existing = await pool.query("select id from indicator_templates where id=$1", [templateId]);
+      const existing = await pool.query("select id,company_id as \"companyId\" from indicator_templates where id=$1", [templateId]);
       if (!existing.rows.length) throw new HttpError(404, "NOT_FOUND", "指标模板不存在");
+      if (!(await mayManageCompany(actor, existing.rows[0].companyId))) throw new HttpError(403, "FORBIDDEN", "无权修改该企业的指标模板");
       await pool.query("update indicator_templates set name=$2,layout=$3 where id=$1", [templateId, data.name, JSON.stringify(data.layout)]);
       return response({ ok: true });
     }
@@ -234,12 +246,13 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
       adminRequired(actor);
       const data = z.object({ cycleId: id, templateId: id, employeeNos: z.array(employeeNo).min(1).max(500) }).parse(await body(req));
       const targetNos = [...new Set(data.employeeNos)];
-      const template = await pool.query("select id,layout from indicator_templates where id=$1", [data.templateId]);
+      const template = await pool.query("select id,layout,company_id as \"companyId\" from indicator_templates where id=$1", [data.templateId]);
       if (!template.rows[0]) throw new HttpError(404, "NOT_FOUND", "指标模板不存在");
+      if (!(await mayManageCompany(actor, template.rows[0].companyId))) throw new HttpError(403, "FORBIDDEN", "无权使用该企业的指标模板");
       const layout = templateLayout.parse(template.rows[0].layout);
       if (!layout.columns.length) throw new HttpError(422, "TEMPLATE_INCOMPLETE", "模板至少需要保留一个填写字段");
-      const targets = await pool.query("select e.employee_no as \"employeeNo\",e.subsidiary_id as \"subsidiaryId\",a.id as \"assessmentId\",a.status as \"assessmentStatus\" from employees e left join assessments a on a.employee_no=e.employee_no and a.cycle_id=$2 where e.employee_no=any($1::text[]) and e.status='ACTIVE'", [targetNos, data.cycleId]);
-      if (targets.rows.length !== targetNos.length || targets.rows.some((target) => !mayAdmin(actor, target.subsidiaryId))) throw new HttpError(422, "INVALID_EMPLOYEES", "存在不存在、已停用或无权管理的员工");
+      const targets = await pool.query("select e.employee_no as \"employeeNo\",e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\",a.id as \"assessmentId\",a.status as \"assessmentStatus\" from employees e join subsidiaries s on s.id=e.subsidiary_id left join assessments a on a.employee_no=e.employee_no and a.cycle_id=$2 where e.employee_no=any($1::text[]) and e.status='ACTIVE'", [targetNos, data.cycleId]);
+      if (targets.rows.length !== targetNos.length || targets.rows.some((target) => !mayAdmin(actor, target.subsidiaryId) || target.companyId !== template.rows[0].companyId)) throw new HttpError(422, "INVALID_EMPLOYEES", "员工不存在、已停用、超出授权范围或不属于模板所属企业");
       if (targets.rows.some((target) => target.assessmentId && target.assessmentStatus !== "DRAFT")) throw new HttpError(409, "ASSESSMENT_LOCKED", "员工已开始填报或进入评分，不能覆盖其指标模板");
       const nodes = assessmentNodesFromTemplate(layout);
       const client = await pool.connect();
@@ -409,8 +422,8 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
     if (stopCycle) {
       superRequired(actor);
       const cycleId = id.parse(stopCycle[1]);
-      const result = await pool.query("update cycles set status='STOPPED' where id=$1 and status<>'STOPPED' returning id", [cycleId]);
-      if (!result.rows.length) throw new HttpError(404, "NOT_FOUND", "考核周期不存在或已停止");
+      const result = await pool.query("update cycles set status='STOPPED' where id=$1 and status in ('DRAFT','ACTIVE') returning id", [cycleId]);
+      if (!result.rows.length) throw new HttpError(409, "CYCLE_NOT_STOPPABLE", "考核周期不存在、已停止或当前不可停止");
       await pool.query("insert into audit_logs (id,actor_employee_no,action,entity_type,entity_id) values ($1,$2,'STOP_CYCLE','CYCLE',$3)", [randomUUID(), actor.employeeNo, cycleId]);
       return response({ id: cycleId, status: "STOPPED" });
     }
@@ -440,11 +453,24 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ path: str
   try {
     guardOrigin(req);
     const actor = await actorRequired(); const path = (await ctx.params).path.join("/");
+    const cycle = path.match(/^cycles\/([^/]+)$/);
+    if (cycle) {
+      superRequired(actor);
+      const cycleId = id.parse(cycle[1]);
+      const data = cycleInput.parse(await body(req));
+      const result = await pool.query("update cycles set name=$2,starts_at=$3,ends_at=$4 where id=$1 and status='DRAFT' returning id", [cycleId, data.name, data.startsAt ?? null, data.endsAt ?? null]);
+      if (!result.rows.length) throw new HttpError(409, "CYCLE_NOT_EDITABLE", "仅草稿考核周期可编辑，进行中或已停止的周期不可修改");
+      await pool.query("insert into audit_logs (id,actor_employee_no,action,entity_type,entity_id,detail) values ($1,$2,'UPDATE_CYCLE','CYCLE',$3,$4)", [randomUUID(), actor.employeeNo, cycleId, JSON.stringify(data)]);
+      return response({ ok: true });
+    }
     const template = path.match(/^templates\/([^/]+)$/);
     if (template) {
       adminRequired(actor);
       const templateId = id.parse(template[1]);
       const data = z.object({ name: text, layout: templateLayout }).parse(await body(req));
+      const existing = await pool.query("select company_id as \"companyId\" from indicator_templates where id=$1", [templateId]);
+      if (!existing.rows.length) throw new HttpError(404, "NOT_FOUND", "指标模板不存在");
+      if (!(await mayManageCompany(actor, existing.rows[0].companyId))) throw new HttpError(403, "FORBIDDEN", "无权修改该企业的指标模板");
       const result = await pool.query("update indicator_templates set name=$2,layout=$3 where id=$1 returning id", [templateId, data.name, JSON.stringify(data.layout)]);
       if (!result.rows.length) throw new HttpError(404, "NOT_FOUND", "指标模板不存在");
       return response({ ok: true });
@@ -481,11 +507,15 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ path: str
       adminRequired(actor);
       const targetEmployeeNo = employeeNo.parse(employee[1]);
       const data = z.object({ subsidiaryId: id, department: text, position: z.string().max(200).default(""), phone: z.string().max(40).default(""), status: z.enum(["ACTIVE", "INACTIVE"]) }).parse(await body(req));
-      const target = await pool.query("select subsidiary_id as \"subsidiaryId\" from employees where employee_no=$1", [targetEmployeeNo]);
+      const target = await pool.query("select e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=$1", [targetEmployeeNo]);
       if (!target.rows[0]) throw new HttpError(404, "NOT_FOUND", "员工不存在");
       if (!mayAdmin(actor, target.rows[0].subsidiaryId) || !mayAdmin(actor, data.subsidiaryId)) throw new HttpError(403, "FORBIDDEN", "无权修改该员工或目标子公司");
-      const destination = await pool.query("select id from subsidiaries where id=$1", [data.subsidiaryId]);
+      const destination = await pool.query("select id,company_id as \"companyId\" from subsidiaries where id=$1", [data.subsidiaryId]);
       if (!destination.rows.length) throw new HttpError(404, "NOT_FOUND", "目标子公司不存在");
+      if (target.rows[0].companyId !== destination.rows[0].companyId) {
+        const history = await pool.query("select 1 from assessments where employee_no=$1 limit 1", [targetEmployeeNo]);
+        if (history.rows.length) throw new HttpError(409, "EMPLOYEE_HISTORY_EXISTS", "该员工存在历史考核记录，禁止跨企业调动");
+      }
       const result = await pool.query("update employees set subsidiary_id=$2,department=$3,position=$4,phone=$5,status=$6 where employee_no=$1 returning employee_no", [targetEmployeeNo, data.subsidiaryId, data.department, data.position, data.phone, data.status]);
       if (!result.rows.length) throw new HttpError(404, "NOT_FOUND", "员工不存在");
       return response({ ok: true });

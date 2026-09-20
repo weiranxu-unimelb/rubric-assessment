@@ -48,6 +48,7 @@ export const cycles = pgTable("cycles", {
 
 export const indicatorTemplates = pgTable("indicator_templates", {
   id: text("id").primaryKey(),
+  companyId: text("company_id").notNull().references(() => companies.id),
   name: text("name").notNull(),
   minIndicators: integer("min_indicators").notNull().default(1),
   maxIndicators: integer("max_indicators").notNull().default(10),

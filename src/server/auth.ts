@@ -55,6 +55,11 @@ export async function destroySession(): Promise<void> {
   jar.delete(COOKIE_NAME);
 }
 
+export async function revokeAllSessions(employeeNo: string): Promise<void> {
+  await db.delete(sessions).where(eq(sessions.employeeNo, employeeNo));
+  (await cookies()).delete(COOKIE_NAME);
+}
+
 export async function getActor(): Promise<Actor | null> {
   const token = (await cookies()).get(COOKIE_NAME)?.value;
   if (!token) return null;

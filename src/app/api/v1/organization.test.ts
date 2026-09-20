@@ -7,7 +7,7 @@ const companyId = "11111111-1111-4111-8111-111111111111";
 const subsidiaryId = "22222222-2222-4222-8222-222222222222";
 
 vi.mock("@/server/db", () => ({ pool: { query, connect }, db: {} }));
-vi.mock("@/server/auth", () => ({ getActor: async () => actor, mayAdmin: (value: { isSuperAdmin: boolean; adminSubsidiaryIds: string[] }, targetSubsidiaryId: string) => value.isSuperAdmin || value.adminSubsidiaryIds.includes(targetSubsidiaryId) }));
+vi.mock("@/server/auth", () => ({ getActor: async () => actor, mayAdmin: (value: { isSuperAdmin: boolean; adminSubsidiaryIds: string[] }, targetSubsidiaryId: string) => value.isSuperAdmin || value.adminSubsidiaryIds.includes(targetSubsidiaryId), verifyPassword: async () => true, hashPassword: async () => "hash", revokeAllSessions: vi.fn(), createSession: vi.fn() }));
 
 import { DELETE, PATCH, POST } from "./[...path]/route";
 
@@ -45,6 +45,20 @@ describe("subsidiary management", () => {
     expect(query).toHaveBeenCalledWith(expect.stringContaining("insert into cycles"), expect.arrayContaining(["2026 年度考核"]));
   });
 
+  it("lets a super administrator edit a draft cycle's name and schedule", async () => {
+    query.mockResolvedValue({ rows: [{ id: companyId }], rowCount: 1 });
+    const request = new NextRequest(`http://localhost:3000/api/v1/cycles/${companyId}`, {
+      method: "PATCH", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
+      body: JSON.stringify({ name: "2026 年度考核（修订）", startsAt: "2026-01-01T00:00:00.000Z", endsAt: "2026-12-31T23:59:59.000Z" }),
+    });
+
+    const response = await PATCH(request, { params: Promise.resolve({ path: ["cycles", companyId] }) });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("update cycles set name=$2"), expect.arrayContaining([companyId, "2026 年度考核（修订）"]));
+  });
+
   it("allows an administrator to approve a submitted assessment in a draft cycle", async () => {
     clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
     clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [{ key: "review-key" }], rowCount: 1 }).mockResolvedValueOnce({ rows: [{ id: companyId, employeeNo: "E1001", status: "SUBMITTED", version: 3, subsidiaryId, cycleStatus: "DRAFT" }] }).mockResolvedValueOnce({ rows: [{ scorerEmployeeNo: "E1002" }] });
@@ -71,7 +85,7 @@ describe("subsidiary management", () => {
     expect((await response.json()).version).toBe(3);
   });
 
-  it("lets a scorer revise an already submitted score before the cycle is stopped", async () => {
+  it("rejects changes to an already submitted score", async () => {
     clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
     const leafId = "33333333-3333-4333-8333-333333333333";
     clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 })
@@ -84,8 +98,8 @@ describe("subsidiary management", () => {
 
     const response = await PATCH(request, { params: Promise.resolve({ path: ["scorer", "tasks", companyId] }) });
 
-    expect(response.status).toBe(200);
-    expect((await response.json()).version).toBe(3);
+    expect(response.status).toBe(409);
+    expect((await response.json()).error.code).toBe("LOCKED");
   });
 
   it("lets a super administrator stop a cycle", async () => {
@@ -103,7 +117,7 @@ describe("subsidiary management", () => {
   it("lets an administrator update an employee's editable profile fields", async () => {
     actor.isSuperAdmin = false;
     actor.adminSubsidiaryIds = [subsidiaryId];
-    query.mockResolvedValueOnce({ rows: [{ subsidiaryId }] }).mockResolvedValueOnce({ rows: [{ id: subsidiaryId }] }).mockResolvedValueOnce({ rows: [{ employeeNo: "E1001" }] });
+    query.mockResolvedValueOnce({ rows: [{ subsidiaryId, companyId }] }).mockResolvedValueOnce({ rows: [{ id: subsidiaryId, companyId }] }).mockResolvedValueOnce({ rows: [{ employeeNo: "E1001" }] });
     const request = new NextRequest("http://localhost:3000/api/v1/employees/E1001", {
       method: "PATCH", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
       body: JSON.stringify({ subsidiaryId, department: "人力资源部", position: "专员", phone: "13800000000", status: "ACTIVE" }),
@@ -113,6 +127,19 @@ describe("subsidiary management", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ok: true });
+  });
+
+  it("rejects moving an employee with assessment history to another company", async () => {
+    query.mockResolvedValueOnce({ rows: [{ subsidiaryId, companyId: "source-company" }] })
+      .mockResolvedValueOnce({ rows: [{ id: subsidiaryId, companyId: "target-company" }] })
+      .mockResolvedValueOnce({ rows: [{ exists: 1 }] });
+    const request = new NextRequest("http://localhost:3000/api/v1/employees/E1001", {
+      method: "PATCH", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
+      body: JSON.stringify({ subsidiaryId, department: "人力资源部", position: "专员", phone: "", status: "ACTIVE" }),
+    });
+    const response = await PATCH(request, { params: Promise.resolve({ path: ["employees", "E1001"] }) });
+    expect(response.status).toBe(409);
+    expect((await response.json()).error.code).toBe("EMPLOYEE_HISTORY_EXISTS");
   });
 
   it("requires the exact acknowledgement before permanently deleting an employee", async () => {
@@ -220,7 +247,7 @@ describe("subsidiary management", () => {
   });
 
   it("lets an administrator update a saved template structure", async () => {
-    query.mockResolvedValueOnce({ rows: [{ id: companyId }] });
+    query.mockResolvedValueOnce({ rows: [{ id: companyId, companyId }] }).mockResolvedValueOnce({ rows: [{ id: companyId }] });
     const request = new NextRequest(`http://localhost:3000/api/v1/templates/${companyId}`, {
       method: "PATCH", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
       body: JSON.stringify({ name: "人事专员模板", layout: { columns: [{ id: "indicator", label: "指标名称", type: "TEXT", required: true }], rows: [{ id: "row-1", label: "" }] } }),
@@ -237,7 +264,7 @@ describe("subsidiary management", () => {
     clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
     const request = new NextRequest("http://localhost:3000/api/v1/templates", {
       method: "POST", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
-      body: JSON.stringify({ name: "空白树模板", layout: { columns: [{ id: "indicator", label: "指标名称", type: "TEXT", required: true }], rows: [], tree: [{ name: "", description: "", scoringRule: "", maxScore: null, children: [] }] } }),
+      body: JSON.stringify({ companyId, name: "空白树模板", layout: { columns: [{ id: "indicator", label: "指标名称", type: "TEXT", required: true }], rows: [], tree: [{ name: "", description: "", scoringRule: "", maxScore: null, children: [] }] } }),
     });
 
     const response = await POST(request, { params: Promise.resolve({ path: ["templates"] }) });

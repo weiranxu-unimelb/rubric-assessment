@@ -234,7 +234,7 @@ async function taskForUpdate(client: PoolClient, actor: Actor, taskId: string) {
 export async function saveScore(actor: Actor, taskId: string, expectedVersion: number, items: { nodeId: string; score: number; comment: string }[]) {
   return inTransaction(async (client) => {
     const task = await taskForUpdate(client, actor, taskId);
-    if (!["PENDING", "SUBMITTED"].includes(task.status) || !["SCORING", "COMPLETED"].includes(task.assessmentStatus) || !["DRAFT", "ACTIVE"].includes(task.cycleStatus)) throw new HttpError(409, "LOCKED", "考核周期已停止或打分任务不可编辑");
+    if (task.status !== "PENDING" || task.assessmentStatus !== "SCORING" || !["DRAFT", "ACTIVE"].includes(task.cycleStatus)) throw new HttpError(409, "LOCKED", "评分已提交或考核周期已停止，不能再修改");
     assertVersion(task.version, expectedVersion);
     const ids = items.map((item) => item.nodeId);
     if (new Set(ids).size !== ids.length) throw new HttpError(422, "DUPLICATE_NODES", "打分项不可重复");
@@ -250,19 +250,7 @@ export async function saveScore(actor: Actor, taskId: string, expectedVersion: n
         on conflict (task_id,node_id) do update set score=excluded.score, comment=excluded.comment`,
         [taskId, item.nodeId, item.score, item.comment]);
     }
-    let revisedTotal: number | null = null;
-    if (task.status === "SUBMITTED") {
-      const savedScores = await client.query("select score from score_items where task_id=$1", [taskId]);
-      if (savedScores.rows.length === leaves.rows.length) revisedTotal = Math.round(savedScores.rows.reduce((sum, row) => sum + Number(row.score), 0) * 100) / 100;
-    }
-    await client.query("update score_tasks set version=version+1,total_score=coalesce($2,total_score),submitted_at=case when $2::numeric is null then submitted_at else now() end where id=$1", [taskId, revisedTotal]);
-    if (revisedTotal !== null) {
-      const all = await client.query("select status, total_score from score_tasks where assessment_id=$1", [task.assessmentId]);
-      if (all.rows.every((row) => row.status === "SUBMITTED" && row.total_score !== null)) {
-        const finalScore = calculateFinalScore(all.rows.map((row) => Number(row.total_score)));
-        await client.query("update assessments set status='COMPLETED',final_score=$2,version=version+1,completed_at=now() where id=$1", [task.assessmentId, finalScore]);
-      }
-    }
+    await client.query("update score_tasks set version=version+1 where id=$1", [taskId]);
     await audit(client, actor, "SAVE_SCORE", "SCORE_TASK", taskId);
     return { id: taskId, version: task.version + 1 };
   });
@@ -271,7 +259,7 @@ export async function saveScore(actor: Actor, taskId: string, expectedVersion: n
 export async function submitScore(actor: Actor, taskId: string, expectedVersion: number, key: string | null) {
   return withIdempotency(actor, key, { taskId, expectedVersion, action: "SUBMIT_SCORE" }, async (client) => {
     const task = await taskForUpdate(client, actor, taskId);
-    if (!["PENDING", "SUBMITTED"].includes(task.status) || !["SCORING", "COMPLETED"].includes(task.assessmentStatus) || !["DRAFT", "ACTIVE"].includes(task.cycleStatus)) throw new HttpError(409, "LOCKED", "考核周期已停止或打分任务不可提交");
+    if (task.status !== "PENDING" || task.assessmentStatus !== "SCORING" || !["DRAFT", "ACTIVE"].includes(task.cycleStatus)) throw new HttpError(409, "LOCKED", "评分已提交或考核周期已停止，不能再提交");
     assertVersion(task.version, expectedVersion);
     const leaves = await client.query(`select n.id, n.max_score as "maxScore", i.score from indicator_nodes n
       left join score_items i on i.node_id=n.id and i.task_id=$2
