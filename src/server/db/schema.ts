@@ -1,4 +1,4 @@
-import { pgTable, text, integer, boolean, numeric, timestamp, primaryKey, unique, index } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, boolean, numeric, timestamp, jsonb, primaryKey, unique, index } from "drizzle-orm/pg-core";
 
 export const companies = pgTable("companies", {
   id: text("id").primaryKey(),
@@ -38,7 +38,7 @@ export const sessions = pgTable("sessions", {
 
 export const cycles = pgTable("cycles", {
   id: text("id").primaryKey(),
-  companyId: text("company_id").notNull().references(() => companies.id),
+  companyId: text("company_id").references(() => companies.id),
   name: text("name").notNull(),
   status: text("status").notNull().default("DRAFT"),
   startsAt: timestamp("starts_at", { withTimezone: true }),
@@ -46,10 +46,38 @@ export const cycles = pgTable("cycles", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+export const indicatorTemplates = pgTable("indicator_templates", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  minIndicators: integer("min_indicators").notNull().default(1),
+  maxIndicators: integer("max_indicators").notNull().default(10),
+  layout: jsonb("layout").notNull().default({ columns: [], rows: [] }),
+  createdBy: text("created_by").notNull().references(() => employees.employeeNo),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const indicatorTemplateNodes = pgTable("indicator_template_nodes", {
+  id: text("id").primaryKey(),
+  templateId: text("template_id").notNull().references(() => indicatorTemplates.id),
+  name: text("name").notNull().default(""),
+  deductionRule: text("deduction_rule").notNull().default(""),
+  maxScore: numeric("max_score", { precision: 6, scale: 2 }),
+  sortOrder: integer("sort_order").notNull().default(0),
+});
+
+export const templateAssignments = pgTable("template_assignments", {
+  cycleId: text("cycle_id").notNull().references(() => cycles.id),
+  employeeNo: text("employee_no").notNull().references(() => employees.employeeNo),
+  templateId: text("template_id").notNull().references(() => indicatorTemplates.id),
+  assignedBy: text("assigned_by").notNull().references(() => employees.employeeNo),
+  assignedAt: timestamp("assigned_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [primaryKey({ columns: [table.cycleId, table.employeeNo] })]);
+
 export const assessments = pgTable("assessments", {
   id: text("id").primaryKey(),
   cycleId: text("cycle_id").notNull().references(() => cycles.id),
   employeeNo: text("employee_no").notNull().references(() => employees.employeeNo),
+  templateId: text("template_id").references(() => indicatorTemplates.id),
   status: text("status").notNull().default("DRAFT"),
   version: integer("version").notNull().default(1),
   finalScore: numeric("final_score", { precision: 5, scale: 2 }),

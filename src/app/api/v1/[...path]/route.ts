@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { PoolClient } from "pg";
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import ExcelJS from "exceljs";
@@ -6,7 +7,7 @@ import { createSession, destroySession, getActor, hashPassword, mayAdmin, verify
 import { pool } from "@/server/db";
 import { loadState } from "@/server/state";
 import { isAllowedOrigin } from "@/server/origin";
-import { approveAssessment, configureAssessment, HttpError, publishCycle, returnAssessment, saveScore, saveSelf, submitScore, submitSelf } from "@/server/workflows";
+import { approveAssessment, configureAssessment, HttpError, publishCycle, returnAssessment, saveOwnIndicatorTree, saveScore, saveSelf, submitScore, submitSelf } from "@/server/workflows";
 import { buildIndicatorNodes, validateIndicatorHierarchy, type IndicatorGroupDraft } from "@/lib/indicator-hierarchy";
 
 export const runtime = "nodejs";
@@ -17,6 +18,36 @@ const newPassword = z.string().min(10).max(128).regex(/^(?=.*[A-Za-z])(?=.*\d).+
 const score = z.number().finite().min(0).max(100);
 const node = z.object({ nodeCode: text, parentCode: text.nullable(), name: text, description: z.string().max(2000).default(""), scoringRule: z.string().max(2000).default(""), maxScore: score, sortOrder: z.number().int().default(0) });
 const employeeImportRow = z.object({ employeeNo, name: text, subsidiaryName: text, department: text, position: z.string().max(200), phone: z.string().max(40), initialPassword: newPassword });
+const sensitiveConfirmation = "我知道是敏感操作，确认删除";
+const templateColumn = z.object({ id: z.string().trim().min(1).max(80), label: z.string().trim().min(1).max(80), type: z.enum(["TEXT", "TEXTAREA", "NUMBER", "DATE"]), required: z.boolean() });
+const templateRow = z.object({ id: z.string().trim().min(1).max(80), label: z.string().trim().max(120).default("") });
+const templateTreeNode = z.object({ name: z.string().max(200).default(""), description: z.string().max(2000).default(""), scoringRule: z.string().max(2000).default(""), maxScore: z.number().finite().min(0).max(100).nullable().optional() });
+const templateTreeGroup = templateTreeNode.extend({ children: z.array(templateTreeNode).max(100).default([]) });
+const templateLayout = z.object({ columns: z.array(templateColumn).min(1).max(30), rows: z.array(templateRow).max(100), tree: z.array(templateTreeGroup).max(100).default([]) }).superRefine((value, ctx) => { if (new Set(value.columns.map((column) => column.id)).size !== value.columns.length) ctx.addIssue({ code: "custom", message: "字段标识不可重复" }); if (new Set(value.rows.map((row) => row.id)).size !== value.rows.length) ctx.addIssue({ code: "custom", message: "预设行标识不可重复" }); });
+
+function assessmentNodesFromTemplate(layout: z.infer<typeof templateLayout>) {
+  const groups: IndicatorGroupDraft[] = layout.tree.map((group) => ({
+    name: group.name, description: group.description, scoringRule: group.scoringRule, maxScore: group.maxScore === undefined || group.maxScore === null ? "" : String(group.maxScore),
+    children: group.children.map((child) => ({ name: child.name, description: child.description, scoringRule: child.scoringRule, maxScore: child.maxScore === undefined || child.maxScore === null ? "" : String(child.maxScore) })),
+  }));
+  if (groups.length && !validateIndicatorHierarchy(groups).length) return buildIndicatorNodes(groups);
+  if (groups.length) {
+    const configuredTotal = groups.reduce((total, group) => total + Number(group.maxScore), 0);
+    const groupScores = groups.every((group) => Number(group.maxScore) > 0) && Math.abs(configuredTotal - 100) < 0.001
+      ? groups.map((group) => Number(group.maxScore))
+      : groups.map((_, index) => index === groups.length - 1 ? 100 - Number((100 / groups.length * index).toFixed(2)) : Number((100 / groups.length).toFixed(2)));
+    return buildIndicatorNodes(groups.map((group, groupIndex) => {
+      const groupScore = groupScores[groupIndex];
+      const childTotal = group.children.reduce((total, child) => total + Number(child.maxScore), 0);
+      const childScores = group.children.every((child) => Number(child.maxScore) > 0) && Math.abs(childTotal - groupScore) < 0.001
+        ? group.children.map((child) => Number(child.maxScore))
+        : group.children.map((_, index) => index === group.children.length - 1 ? groupScore - Number((groupScore / group.children.length * index).toFixed(2)) : Number((groupScore / group.children.length).toFixed(2)));
+      return { ...group, name: group.name.trim() || `待填写一级指标 ${groupIndex + 1}`, maxScore: String(groupScore), children: group.children.map((child, childIndex) => ({ ...child, name: child.name.trim() || `待填写二级指标 ${groupIndex + 1}-${childIndex + 1}`, maxScore: String(childScores[childIndex]) })) };
+    }));
+  }
+  const presetRows = layout.rows.length ? layout.rows : [{ id: "default", label: "" }];
+  return [{ nodeCode: "R", parentCode: null, name: "年度考核", description: "", scoringRule: "", maxScore: 100, sortOrder: 0 }, ...presetRows.map((row, index) => ({ nodeCode: `T${index + 1}`, parentCode: "R", name: row.label.trim() || `待填写指标 ${index + 1}`, description: "", scoringRule: "", maxScore: index === presetRows.length - 1 ? 100 - Number((100 / presetRows.length * index).toFixed(2)) : Number((100 / presetRows.length).toFixed(2)), sortOrder: index + 1 }))];
+}
 
 function response(data: unknown, status = 200) { return NextResponse.json(data, { status }); }
 function failure(error: unknown) {
@@ -52,6 +83,23 @@ async function createEmployee(actor: Actor, value: unknown) {
   const passwordHash = await hashPassword(data.initialPassword);
   await pool.query("insert into employees (employee_no,subsidiary_id,name,department,position,phone,password_hash) values ($1,$2,$3,$4,$5,$6,$7)", [data.employeeNo, data.subsidiaryId, data.name, data.department, data.position, data.phone, passwordHash]);
   return { employeeNo: data.employeeNo };
+}
+async function deleteAssessmentsForEmployees(client: PoolClient, employeeNos: string[]) {
+  if (!employeeNos.length) return;
+  await client.query("delete from score_items where task_id in (select id from score_tasks where scorer_employee_no=any($1::text[]) or assessment_id in (select id from assessments where employee_no=any($1::text[])))", [employeeNos]);
+  await client.query("delete from score_tasks where scorer_employee_no=any($1::text[]) or assessment_id in (select id from assessments where employee_no=any($1::text[]))", [employeeNos]);
+  await client.query("delete from indicator_nodes where assessment_id in (select id from assessments where employee_no=any($1::text[]))", [employeeNos]);
+  await client.query("delete from assessments where employee_no=any($1::text[])", [employeeNos]);
+  await client.query("delete from scorer_assignments where employee_no=any($1::text[]) or scorer_employee_no=any($1::text[])", [employeeNos]);
+}
+async function deleteCycles(client: PoolClient, cycleIds: string[]) {
+  if (!cycleIds.length) return;
+  await client.query("delete from score_items where task_id in (select id from score_tasks where assessment_id in (select id from assessments where cycle_id=any($1::text[])))", [cycleIds]);
+  await client.query("delete from score_tasks where assessment_id in (select id from assessments where cycle_id=any($1::text[]))", [cycleIds]);
+  await client.query("delete from indicator_nodes where assessment_id in (select id from assessments where cycle_id=any($1::text[]))", [cycleIds]);
+  await client.query("delete from assessments where cycle_id=any($1::text[])", [cycleIds]);
+  await client.query("delete from scorer_assignments where cycle_id=any($1::text[])", [cycleIds]);
+  await client.query("delete from cycles where id=any($1::text[])", [cycleIds]);
 }
 async function excelResponse(rows: (string | number | null)[][], name: string) {
   const workbook = new ExcelJS.Workbook();
@@ -103,10 +151,10 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ path: strin
       }
       adminRequired(actor);
       const scope = actor.isSuperAdmin ? null : actor.adminSubsidiaryIds;
-      const pending = await pool.query(`select e.employee_no from employees e join subsidiaries s on s.id=e.subsidiary_id
+      const pending = await pool.query(`select e.employee_no from employees e
         left join assessments a on a.employee_no=e.employee_no and a.cycle_id=$1
-        where s.company_id=$2 and e.status='ACTIVE' and ($3::text[] is null or e.subsidiary_id=any($3::text[]))
-        and (a.id is null or a.status<>'COMPLETED') limit 1`, [cycleId, cycle.rows[0].company_id, scope]);
+        where e.status='ACTIVE' and ($2::text[] is null or e.subsidiary_id=any($2::text[]))
+        and (a.id is null or a.status<>'COMPLETED') limit 1`, [cycleId, scope]);
       if (pending.rows.length) throw new HttpError(409, "NOT_COMPLETE", "授权范围内所有人员完成打分后才可导出");
       const result = await pool.query(`select a.employee_no, e.name, s.name as subsidiary_name, c.name as cycle_name, a.status, a.final_score, a.completed_at from assessments a
         join employees e on e.employee_no=a.employee_no join subsidiaries s on s.id=e.subsidiary_id
@@ -158,12 +206,57 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
     }
     if (path === "cycles") {
       superRequired(actor);
-      const data = z.object({ companyId: id, name: text }).parse(await body(req));
+      const data = z.object({ name: text }).parse(await body(req));
       const newId = randomUUID();
-      await pool.query("insert into cycles (id,company_id,name) values ($1,$2,$3)", [newId, data.companyId, data.name]);
+      await pool.query("insert into cycles (id,name) values ($1,$2)", [newId, data.name]);
       return response({ id: newId }, 201);
     }
     if (path === "employees") { adminRequired(actor); return response(await createEmployee(actor, await body(req)), 201); }
+    if (path === "templates") {
+      adminRequired(actor);
+      const data = z.object({ name: text, layout: templateLayout }).parse(await body(req));
+      const templateId = randomUUID(); const client = await pool.connect();
+      try { await client.query("begin"); await client.query("insert into indicator_templates (id,name,layout,created_by) values ($1,$2,$3,$4)", [templateId, data.name, JSON.stringify(data.layout), actor.employeeNo]); await client.query("commit"); } catch (error) { await client.query("rollback"); throw error; } finally { client.release(); }
+      return response({ id: templateId }, 201);
+    }
+    const templateMatch = path.match(/^templates\/([^/]+)$/);
+    if (templateMatch) {
+      adminRequired(actor);
+      const templateId = id.parse(templateMatch[1]);
+      const data = z.object({ name: text, layout: templateLayout }).parse(await body(req));
+      const existing = await pool.query("select id from indicator_templates where id=$1", [templateId]);
+      if (!existing.rows.length) throw new HttpError(404, "NOT_FOUND", "指标模板不存在");
+      await pool.query("update indicator_templates set name=$2,layout=$3 where id=$1", [templateId, data.name, JSON.stringify(data.layout)]);
+      return response({ ok: true });
+    }
+    if (path === "template-assignments") {
+      adminRequired(actor);
+      const data = z.object({ cycleId: id, templateId: id, employeeNos: z.array(employeeNo).min(1).max(500) }).parse(await body(req));
+      const targetNos = [...new Set(data.employeeNos)];
+      const template = await pool.query("select id,layout from indicator_templates where id=$1", [data.templateId]);
+      if (!template.rows[0]) throw new HttpError(404, "NOT_FOUND", "指标模板不存在");
+      const layout = templateLayout.parse(template.rows[0].layout);
+      if (!layout.columns.length) throw new HttpError(422, "TEMPLATE_INCOMPLETE", "模板至少需要保留一个填写字段");
+      const targets = await pool.query("select e.employee_no as \"employeeNo\",e.subsidiary_id as \"subsidiaryId\",a.id as \"assessmentId\" from employees e left join assessments a on a.employee_no=e.employee_no and a.cycle_id=$2 where e.employee_no=any($1::text[]) and e.status='ACTIVE'", [targetNos, data.cycleId]);
+      if (targets.rows.length !== targetNos.length || targets.rows.some((target) => !mayAdmin(actor, target.subsidiaryId))) throw new HttpError(422, "INVALID_EMPLOYEES", "存在不存在、已停用或无权管理的员工");
+      const nodes = assessmentNodesFromTemplate(layout);
+      const client = await pool.connect();
+      try { await client.query("begin"); for (const targetNo of targetNos) await client.query("insert into template_assignments (cycle_id,employee_no,template_id,assigned_by) values ($1,$2,$3,$4) on conflict (cycle_id,employee_no) do update set template_id=excluded.template_id,assigned_by=excluded.assigned_by,assigned_at=now()", [data.cycleId, targetNo, data.templateId, actor.employeeNo]); await client.query("commit"); } catch (error) { await client.query("rollback"); throw error; } finally { client.release(); }
+      for (const target of targets.rows.filter((item) => !item.assessmentId)) await configureAssessment(actor, { cycleId: data.cycleId, employeeNo: target.employeeNo, scorers: [], nodes, templateId: data.templateId });
+      return response({ assigned: targetNos.length });
+    }
+    if (path === "scorer-assignments") {
+      adminRequired(actor);
+      const data = z.object({ cycleId: id, employeeNo, scorerEmployeeNos: z.array(employeeNo).min(1).max(20) }).parse(await body(req));
+      if (data.scorerEmployeeNos.includes(data.employeeNo) || new Set(data.scorerEmployeeNos).size !== data.scorerEmployeeNos.length) throw new HttpError(422, "INVALID_SCORERS", "打分人不可重复或为本人");
+      const target = await pool.query("select e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=$2 and e.status='ACTIVE' and (exists (select 1 from assessments a where a.cycle_id=$1 and a.employee_no=e.employee_no and a.status='DRAFT') or exists (select 1 from template_assignments ta where ta.cycle_id=$1 and ta.employee_no=e.employee_no))", [data.cycleId, data.employeeNo]);
+      if (!target.rows[0] || !mayAdmin(actor, target.rows[0].subsidiaryId)) throw new HttpError(422, "ASSESSMENT_REQUIRED", "请先为该员工导入指标，或匹配指标模板");
+      const scorerRows = await pool.query("select e.employee_no as \"employeeNo\",e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=any($1::text[]) and e.status='ACTIVE'", [data.scorerEmployeeNos]);
+      if (scorerRows.rows.length !== data.scorerEmployeeNos.length || scorerRows.rows.some((scorer) => scorer.companyId !== target.rows[0].companyId || !mayAdmin(actor, scorer.subsidiaryId))) throw new HttpError(422, "INVALID_SCORERS", "打分人必须是在职员工，并且属于同一企业及管理员授权范围");
+      const client = await pool.connect();
+      try { await client.query("begin"); await client.query("delete from scorer_assignments where cycle_id=$1 and employee_no=$2", [data.cycleId, data.employeeNo]); for (const scorerNo of data.scorerEmployeeNos) await client.query("insert into scorer_assignments (id,cycle_id,employee_no,scorer_employee_no) values ($1,$2,$3,$4)", [randomUUID(), data.cycleId, data.employeeNo, scorerNo]); await client.query("commit"); } catch (error) { await client.query("rollback"); throw error; } finally { client.release(); }
+      return response({ ok: true });
+    }
     if (path === "admin-scopes") {
       superRequired(actor);
       const data = z.object({ employeeNo, subsidiaryId: id }).parse(await body(req));
@@ -336,6 +429,15 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ path: str
   try {
     guardOrigin(req);
     const actor = await actorRequired(); const path = (await ctx.params).path.join("/");
+    const template = path.match(/^templates\/([^/]+)$/);
+    if (template) {
+      adminRequired(actor);
+      const templateId = id.parse(template[1]);
+      const data = z.object({ name: text, layout: templateLayout }).parse(await body(req));
+      const result = await pool.query("update indicator_templates set name=$2,layout=$3 where id=$1 returning id", [templateId, data.name, JSON.stringify(data.layout)]);
+      if (!result.rows.length) throw new HttpError(404, "NOT_FOUND", "指标模板不存在");
+      return response({ ok: true });
+    }
     const company = path.match(/^companies\/([^/]+)$/);
     if (company) {
       superRequired(actor);
@@ -368,6 +470,11 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ path: str
       const data = z.object({ version: z.number().int().positive(), values: z.array(z.object({ nodeId: id, content: z.string().max(4000) })).max(300) }).parse(await body(req));
       return response(await saveSelf(actor, id.parse(self[1]), data.version, data.values));
     }
+    const ownTree = path.match(/^my\/assessments\/([^/]+)\/tree$/);
+    if (ownTree) {
+      const data = z.object({ version: z.number().int().positive(), nodes: z.array(node).min(2).max(300) }).parse(await body(req));
+      return response(await saveOwnIndicatorTree(actor, id.parse(ownTree[1]), data.version, data.nodes));
+    }
     const task = path.match(/^scorer\/tasks\/([^/]+)$/);
     if (task) {
       const data = z.object({ version: z.number().int().positive(), items: z.array(z.object({ nodeId: id, score, comment: z.string().max(2000) })).max(300) }).parse(await body(req));
@@ -385,6 +492,57 @@ export async function DELETE(req: NextRequest, ctx: { params: Promise<{ path: st
     if (path === "admin-scopes") {
       const data = z.object({ employeeNo, subsidiaryId: id }).parse(await body(req));
       await pool.query("delete from admin_scopes where admin_employee_no=$1 and subsidiary_id=$2", [data.employeeNo, data.subsidiaryId]);
+      return response({ ok: true });
+    }
+    const target = path.match(/^(employees|subsidiaries|companies|cycles)\/([^/]+)$/);
+    if (target) {
+      const entity = target[1]; const targetId = entity === "employees" ? employeeNo.parse(target[2]) : id.parse(target[2]);
+      const data = z.object({ confirmation: z.literal(sensitiveConfirmation, `请输入“${sensitiveConfirmation}”以确认`) }).parse(await body(req));
+      void data;
+      if (entity === "employees" && targetId === actor.employeeNo) throw new HttpError(409, "SELF_DELETE", "不能删除当前登录的超级管理员账号");
+      const client = await pool.connect();
+      try {
+        await client.query("begin");
+        if (entity === "employees") {
+          const exists = await client.query("select employee_no from employees where employee_no=$1 for update", [targetId]);
+          if (!exists.rows.length) throw new HttpError(404, "NOT_FOUND", "员工不存在");
+          await deleteAssessmentsForEmployees(client, [targetId]);
+          await client.query("delete from admin_scopes where admin_employee_no=$1", [targetId]);
+          await client.query("delete from sessions where employee_no=$1", [targetId]);
+          await client.query("delete from idempotency_records where actor_employee_no=$1", [targetId]);
+          await client.query("delete from audit_logs where actor_employee_no=$1", [targetId]);
+          await client.query("delete from employees where employee_no=$1", [targetId]);
+        }
+        if (entity === "cycles") await deleteCycles(client, [targetId]);
+        if (entity === "subsidiaries" || entity === "companies") {
+          const subsidiaryRows = await client.query(entity === "subsidiaries" ? "select id from subsidiaries where id=$1 for update" : "select id from subsidiaries where company_id=$1 for update", [targetId]);
+          if (entity === "subsidiaries" && !subsidiaryRows.rows.length) throw new HttpError(404, "NOT_FOUND", "子公司不存在");
+          if (entity === "companies") {
+            const company = await client.query("select id from companies where id=$1 for update", [targetId]);
+            if (!company.rows.length) throw new HttpError(404, "NOT_FOUND", "企业不存在");
+          }
+          const subsidiaryIds = subsidiaryRows.rows.map((row) => row.id as string);
+          const employeeRows = subsidiaryIds.length ? await client.query("select employee_no from employees where subsidiary_id=any($1::text[])", [subsidiaryIds]) : { rows: [] as { employee_no: string }[] };
+          const employeeNos = employeeRows.rows.map((row) => row.employee_no);
+          if (employeeNos.includes(actor.employeeNo)) throw new HttpError(409, "SELF_DELETE", "不能删除当前登录的超级管理员所在组织");
+          const cycleRows = await client.query(entity === "companies" ? "select id from cycles where company_id=$1" : "select c.id from cycles c join subsidiaries s on s.company_id=c.company_id where s.id=$1", [targetId]);
+          await deleteCycles(client, cycleRows.rows.map((row) => row.id as string));
+          await deleteAssessmentsForEmployees(client, employeeNos);
+          if (employeeNos.length) {
+            await client.query("delete from admin_scopes where admin_employee_no=any($1::text[])", [employeeNos]);
+            await client.query("delete from sessions where employee_no=any($1::text[])", [employeeNos]);
+            await client.query("delete from idempotency_records where actor_employee_no=any($1::text[])", [employeeNos]);
+            await client.query("delete from audit_logs where actor_employee_no=any($1::text[])", [employeeNos]);
+            await client.query("delete from employees where employee_no=any($1::text[])", [employeeNos]);
+          }
+          if (subsidiaryIds.length) await client.query("delete from admin_scopes where subsidiary_id=any($1::text[])", [subsidiaryIds]);
+          if (entity === "subsidiaries") await client.query("delete from subsidiaries where id=$1", [targetId]);
+          else { await client.query("delete from subsidiaries where company_id=$1", [targetId]); await client.query("delete from companies where id=$1", [targetId]); }
+        }
+        await client.query("insert into audit_logs (id,actor_employee_no,action,entity_type,entity_id,detail) values ($1,$2,'DELETE',$3,$4,$5)", [randomUUID(), actor.employeeNo, entity.toUpperCase(), targetId, JSON.stringify({ confirmed: true })]);
+        await client.query("commit");
+      } catch (error) { await client.query("rollback"); throw error; }
+      finally { client.release(); }
       return response({ ok: true });
     }
     throw new HttpError(404, "NOT_FOUND", "接口不存在");

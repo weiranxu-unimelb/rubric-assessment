@@ -8,7 +8,7 @@ describe("loadState", () => {
   it("provides an empty management workspace to a super administrator without subsidiaries", async () => {
     const state = await loadState({ employeeNo: "000001", name: "系统管理员", subsidiaryId: "none", isSuperAdmin: true, adminSubsidiaryIds: [] });
 
-    expect(state.admin).toEqual({ employees: [], assessments: [], nodes: [], assignments: [], progress: [] });
+    expect(state.admin).toEqual({ employees: [], assessments: [], nodes: [], assignments: [], progress: [], templateAssignments: [] });
     expect(state.super).not.toBeNull();
   });
 });
