@@ -12,7 +12,8 @@ import { buildIndicatorNodes, validateIndicatorHierarchy, type IndicatorGroupDra
 
 export const runtime = "nodejs";
 const text = z.string().trim().min(1).max(200);
-const id = z.string().uuid();
+// 早期版本使用 32 位十六进制 ID；新版本使用标准 UUID。两者都已落库，接口需兼容。
+const id = z.string().regex(/^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i, "标识格式无效");
 const employeeNo = z.string().trim().min(1).max(40);
 const newPassword = z.string().min(10).max(128).regex(/^(?=.*[A-Za-z])(?=.*\d).+$/, "密码需同时包含字母和数字");
 const score = z.number().finite().min(0).max(100);
@@ -237,12 +238,13 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
       if (!template.rows[0]) throw new HttpError(404, "NOT_FOUND", "指标模板不存在");
       const layout = templateLayout.parse(template.rows[0].layout);
       if (!layout.columns.length) throw new HttpError(422, "TEMPLATE_INCOMPLETE", "模板至少需要保留一个填写字段");
-      const targets = await pool.query("select e.employee_no as \"employeeNo\",e.subsidiary_id as \"subsidiaryId\",a.id as \"assessmentId\" from employees e left join assessments a on a.employee_no=e.employee_no and a.cycle_id=$2 where e.employee_no=any($1::text[]) and e.status='ACTIVE'", [targetNos, data.cycleId]);
+      const targets = await pool.query("select e.employee_no as \"employeeNo\",e.subsidiary_id as \"subsidiaryId\",a.id as \"assessmentId\",a.status as \"assessmentStatus\" from employees e left join assessments a on a.employee_no=e.employee_no and a.cycle_id=$2 where e.employee_no=any($1::text[]) and e.status='ACTIVE'", [targetNos, data.cycleId]);
       if (targets.rows.length !== targetNos.length || targets.rows.some((target) => !mayAdmin(actor, target.subsidiaryId))) throw new HttpError(422, "INVALID_EMPLOYEES", "存在不存在、已停用或无权管理的员工");
+      if (targets.rows.some((target) => target.assessmentId && target.assessmentStatus !== "DRAFT")) throw new HttpError(409, "ASSESSMENT_LOCKED", "员工已开始填报或进入评分，不能覆盖其指标模板");
       const nodes = assessmentNodesFromTemplate(layout);
       const client = await pool.connect();
       try { await client.query("begin"); for (const targetNo of targetNos) await client.query("insert into template_assignments (cycle_id,employee_no,template_id,assigned_by) values ($1,$2,$3,$4) on conflict (cycle_id,employee_no) do update set template_id=excluded.template_id,assigned_by=excluded.assigned_by,assigned_at=now()", [data.cycleId, targetNo, data.templateId, actor.employeeNo]); await client.query("commit"); } catch (error) { await client.query("rollback"); throw error; } finally { client.release(); }
-      for (const target of targets.rows.filter((item) => !item.assessmentId)) await configureAssessment(actor, { cycleId: data.cycleId, employeeNo: target.employeeNo, scorers: [], nodes, templateId: data.templateId });
+      for (const target of targets.rows) await configureAssessment(actor, { cycleId: data.cycleId, employeeNo: target.employeeNo, scorers: [], nodes, templateId: data.templateId, preserveExistingScorers: Boolean(target.assessmentId) });
       return response({ assigned: targetNos.length });
     }
     if (path === "scorer-assignments") {
@@ -403,6 +405,15 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
     }
     const match = path.match(/^cycles\/([^/]+)\/publish$/);
     if (match) return response(await publishCycle(actor, id.parse(match[1]), req.headers.get("idempotency-key")));
+    const stopCycle = path.match(/^cycles\/([^/]+)\/stop$/);
+    if (stopCycle) {
+      superRequired(actor);
+      const cycleId = id.parse(stopCycle[1]);
+      const result = await pool.query("update cycles set status='STOPPED' where id=$1 and status<>'STOPPED' returning id", [cycleId]);
+      if (!result.rows.length) throw new HttpError(404, "NOT_FOUND", "考核周期不存在或已停止");
+      await pool.query("insert into audit_logs (id,actor_employee_no,action,entity_type,entity_id) values ($1,$2,'STOP_CYCLE','CYCLE',$3)", [randomUUID(), actor.employeeNo, cycleId]);
+      return response({ id: cycleId, status: "STOPPED" });
+    }
     const selfSubmit = path.match(/^my\/assessments\/([^/]+)\/submit$/);
     if (selfSubmit) { const data = z.object({ version: z.number().int().positive() }).parse(await body(req)); return response(await submitSelf(actor, id.parse(selfSubmit[1]), data.version, req.headers.get("idempotency-key"))); }
     const review = path.match(/^admin\/assessments\/([^/]+)\/(approve|return)$/);
@@ -463,6 +474,20 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ path: str
       }
       const result = await pool.query("update subsidiaries set name=coalesce($2,name),status=coalesce($3,status) where id=$1 returning id", [subsidiaryId, data.name ?? null, data.status ?? null]);
       if (!result.rows.length) throw new HttpError(404, "NOT_FOUND", "子公司不存在");
+      return response({ ok: true });
+    }
+    const employee = path.match(/^employees\/([^/]+)$/);
+    if (employee) {
+      adminRequired(actor);
+      const targetEmployeeNo = employeeNo.parse(employee[1]);
+      const data = z.object({ subsidiaryId: id, department: text, position: z.string().max(200).default(""), phone: z.string().max(40).default(""), status: z.enum(["ACTIVE", "INACTIVE"]) }).parse(await body(req));
+      const target = await pool.query("select subsidiary_id as \"subsidiaryId\" from employees where employee_no=$1", [targetEmployeeNo]);
+      if (!target.rows[0]) throw new HttpError(404, "NOT_FOUND", "员工不存在");
+      if (!mayAdmin(actor, target.rows[0].subsidiaryId) || !mayAdmin(actor, data.subsidiaryId)) throw new HttpError(403, "FORBIDDEN", "无权修改该员工或目标子公司");
+      const destination = await pool.query("select id from subsidiaries where id=$1", [data.subsidiaryId]);
+      if (!destination.rows.length) throw new HttpError(404, "NOT_FOUND", "目标子公司不存在");
+      const result = await pool.query("update employees set subsidiary_id=$2,department=$3,position=$4,phone=$5,status=$6 where employee_no=$1 returning employee_no", [targetEmployeeNo, data.subsidiaryId, data.department, data.position, data.phone, data.status]);
+      if (!result.rows.length) throw new HttpError(404, "NOT_FOUND", "员工不存在");
       return response({ ok: true });
     }
     const self = path.match(/^my\/assessments\/([^/]+)$/);

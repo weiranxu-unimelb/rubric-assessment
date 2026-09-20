@@ -3,6 +3,7 @@ export type IndicatorChildDraft = {
   description: string;
   scoringRule: string;
   maxScore: string;
+  selfContent?: string;
 };
 
 export type IndicatorGroupDraft = IndicatorChildDraft & {
@@ -17,6 +18,7 @@ export type IndicatorNodeInput = {
   scoringRule: string;
   maxScore: number;
   sortOrder: number;
+  selfContent?: string;
 };
 
 function score(value: string) {
@@ -54,11 +56,11 @@ export function buildIndicatorNodes(groups: IndicatorGroupDraft[]): IndicatorNod
   groups.forEach((group, groupIndex) => {
     const groupCode = `L${groupIndex + 1}`;
     nodes.push({
-      nodeCode: groupCode, parentCode: "R", name: group.name.trim(), description: group.description.trim(), scoringRule: group.scoringRule.trim(), maxScore: score(group.maxScore), sortOrder: groupIndex + 1,
+      nodeCode: groupCode, parentCode: "R", name: group.name.trim(), description: group.description.trim(), scoringRule: group.scoringRule.trim(), maxScore: score(group.maxScore), sortOrder: groupIndex + 1, selfContent: group.selfContent ?? "",
     });
     group.children.forEach((child, childIndex) => {
       nodes.push({
-        nodeCode: `${groupCode}-${childIndex + 1}`, parentCode: groupCode, name: child.name.trim(), description: child.description.trim(), scoringRule: child.scoringRule.trim(), maxScore: score(child.maxScore), sortOrder: (groupIndex + 1) * 100 + childIndex + 1,
+        nodeCode: `${groupCode}-${childIndex + 1}`, parentCode: groupCode, name: child.name.trim(), description: child.description.trim(), scoringRule: child.scoringRule.trim(), maxScore: score(child.maxScore), sortOrder: (groupIndex + 1) * 100 + childIndex + 1, selfContent: child.selfContent ?? "",
       });
     });
   });
