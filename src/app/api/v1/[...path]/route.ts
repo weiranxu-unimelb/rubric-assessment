@@ -20,6 +20,7 @@ const employeeNo = z.string().trim().min(1).max(40);
 const newPassword = z.string().min(10).max(128).regex(/^(?=.*[A-Za-z])(?=.*\d).+$/, "密码需同时包含字母和数字");
 const score = z.number().finite().min(0).max(100);
 const node = z.object({ nodeCode: text, parentCode: text.nullable(), name: text, description: z.string().max(2000).default(""), scoringRule: z.string().max(2000).default(""), maxScore: score, sortOrder: z.number().int().default(0) });
+const draftNode = z.object({ nodeCode: text, parentCode: text.nullable(), name: z.string().max(200).default(""), description: z.string().max(2000).default(""), scoringRule: z.string().max(2000).default(""), maxScore: score, sortOrder: z.number().int().default(0) });
 const employeeImportRow = z.object({ employeeNo, name: text, subsidiaryName: text, department: text, position: z.string().max(200), phone: z.string().max(40), initialPassword: newPassword });
 const sensitiveConfirmation = "我知道是敏感操作，确认删除";
 const templateColumn = z.object({ id: z.string().trim().min(1).max(80), label: z.string().trim().min(1).max(80), type: z.enum(["TEXT", "TEXTAREA", "NUMBER", "DATE"]), required: z.boolean() });
@@ -101,8 +102,29 @@ async function deleteAssessmentsForEmployees(client: PoolClient, employeeNos: st
   await client.query("delete from assessments where employee_no=any($1::text[])", [employeeNos]);
   await client.query("delete from scorer_assignments where employee_no=any($1::text[]) or scorer_employee_no=any($1::text[])", [employeeNos]);
 }
+/**
+ * 模板分配是周期内的配置数据：删除被分配员工时一并删除该员工的分配；
+ * 若删除的是配置人，则保留分配本身并转交给执行删除的超级管理员。
+ */
+async function cleanTemplateReferencesForEmployees(client: PoolClient, employeeNos: string[], replacementOwner: string) {
+  if (!employeeNos.length) return;
+  await client.query("delete from template_assignments where employee_no=any($1::text[])", [employeeNos]);
+  await client.query("update template_assignments set assigned_by=$2 where assigned_by=any($1::text[])", [employeeNos, replacementOwner]);
+  // 模板是企业资产，不能因创建人离职/被删除而丢失；创建归属转交给本次操作人。
+  await client.query("update indicator_templates set created_by=$2 where created_by=any($1::text[])", [employeeNos, replacementOwner]);
+}
+
+/** 删除企业时，企业范围内的模板与模板节点作为企业数据一并永久删除。 */
+async function deleteTemplatesForCompanies(client: PoolClient, companyIds: string[]) {
+  if (!companyIds.length) return;
+  await client.query("delete from template_assignments where template_id in (select id from indicator_templates where company_id=any($1::text[]))", [companyIds]);
+  await client.query("delete from indicator_template_nodes where template_id in (select id from indicator_templates where company_id=any($1::text[]))", [companyIds]);
+  await client.query("delete from indicator_templates where company_id=any($1::text[])", [companyIds]);
+}
+
 async function deleteCycles(client: PoolClient, cycleIds: string[]) {
   if (!cycleIds.length) return;
+  await client.query("delete from template_assignments where cycle_id=any($1::text[])", [cycleIds]);
   await client.query("delete from score_items where task_id in (select id from score_tasks where assessment_id in (select id from assessments where cycle_id=any($1::text[])))", [cycleIds]);
   await client.query("delete from score_tasks where assessment_id in (select id from assessments where cycle_id=any($1::text[]))", [cycleIds]);
   await client.query("delete from indicator_nodes where assessment_id in (select id from assessments where cycle_id=any($1::text[]))", [cycleIds]);
@@ -249,15 +271,39 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
       const template = await pool.query("select id,layout,company_id as \"companyId\" from indicator_templates where id=$1", [data.templateId]);
       if (!template.rows[0]) throw new HttpError(404, "NOT_FOUND", "指标模板不存在");
       if (!(await mayManageCompany(actor, template.rows[0].companyId))) throw new HttpError(403, "FORBIDDEN", "无权使用该企业的指标模板");
-      const layout = templateLayout.parse(template.rows[0].layout);
-      if (!layout.columns.length) throw new HttpError(422, "TEMPLATE_INCOMPLETE", "模板至少需要保留一个填写字段");
-      const targets = await pool.query("select e.employee_no as \"employeeNo\",e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\",a.id as \"assessmentId\",a.status as \"assessmentStatus\" from employees e join subsidiaries s on s.id=e.subsidiary_id left join assessments a on a.employee_no=e.employee_no and a.cycle_id=$2 where e.employee_no=any($1::text[]) and e.status='ACTIVE'", [targetNos, data.cycleId]);
-      if (targets.rows.length !== targetNos.length || targets.rows.some((target) => !mayAdmin(actor, target.subsidiaryId) || target.companyId !== template.rows[0].companyId)) throw new HttpError(422, "INVALID_EMPLOYEES", "员工不存在、已停用、超出授权范围或不属于模板所属企业");
-      if (targets.rows.some((target) => target.assessmentId && target.assessmentStatus !== "DRAFT")) throw new HttpError(409, "ASSESSMENT_LOCKED", "员工已开始填报或进入评分，不能覆盖其指标模板");
-      const nodes = assessmentNodesFromTemplate(layout);
       const client = await pool.connect();
-      try { await client.query("begin"); for (const targetNo of targetNos) await client.query("insert into template_assignments (cycle_id,employee_no,template_id,assigned_by) values ($1,$2,$3,$4) on conflict (cycle_id,employee_no) do update set template_id=excluded.template_id,assigned_by=excluded.assigned_by,assigned_at=now()", [data.cycleId, targetNo, data.templateId, actor.employeeNo]); await client.query("commit"); } catch (error) { await client.query("rollback"); throw error; } finally { client.release(); }
-      for (const target of targets.rows) await configureAssessment(actor, { cycleId: data.cycleId, employeeNo: target.employeeNo, scorers: [], nodes, templateId: data.templateId, preserveExistingScorers: Boolean(target.assessmentId) });
+      try {
+        await client.query("begin");
+        // 与 configureAssessment 使用同一把周期锁，保证同一周期内的配置不会交叉写入。
+        const cycle = await client.query("select id,status from cycles where id=$1 for update", [data.cycleId]);
+        if (!cycle.rows[0] || cycle.rows[0].status !== "DRAFT") throw new HttpError(409, "CYCLE_NOT_DRAFT", "仅草稿周期可配置指标");
+        const lockedTemplate = await client.query("select layout,company_id as \"companyId\" from indicator_templates where id=$1 for update", [data.templateId]);
+        if (!lockedTemplate.rows[0]) throw new HttpError(404, "NOT_FOUND", "指标模板不存在");
+        if (lockedTemplate.rows[0].companyId !== template.rows[0].companyId) throw new HttpError(409, "TEMPLATE_CHANGED", "指标模板已变更，请刷新后重试");
+        const layout = templateLayout.parse(lockedTemplate.rows[0].layout);
+        if (!layout.columns.length) throw new HttpError(422, "TEMPLATE_INCOMPLETE", "模板至少需要保留一个填写字段");
+        const nodes = assessmentNodesFromTemplate(layout);
+        const targets = await client.query("select e.employee_no as \"employeeNo\",e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=any($1::text[]) and e.status='ACTIVE' for update of e", [targetNos]);
+        if (targets.rows.length !== targetNos.length || targets.rows.some((target) => !mayAdmin(actor, target.subsidiaryId) || target.companyId !== lockedTemplate.rows[0].companyId)) throw new HttpError(422, "INVALID_EMPLOYEES", "员工不存在、已停用、超出授权范围或不属于模板所属企业");
+        const assessmentRows = await client.query("select id,employee_no as \"employeeNo\",status from assessments where cycle_id=$1 and employee_no=any($2::text[]) for update", [data.cycleId, targetNos]);
+        const assessmentsByEmployee = new Map(assessmentRows.rows.map((assessment) => [assessment.employeeNo as string, assessment]));
+        if (assessmentRows.rows.some((assessment) => assessment.status !== "DRAFT")) throw new HttpError(409, "ASSESSMENT_LOCKED", "员工已开始填报或进入评分，不能覆盖其指标模板");
+        for (const targetNo of targetNos) {
+          await client.query("insert into template_assignments (cycle_id,employee_no,template_id,assigned_by) values ($1,$2,$3,$4) on conflict (cycle_id,employee_no) do update set template_id=excluded.template_id,assigned_by=excluded.assigned_by,assigned_at=now()", [data.cycleId, targetNo, data.templateId, actor.employeeNo]);
+          const existing = assessmentsByEmployee.get(targetNo);
+          const assessmentId = (existing?.id as string | undefined) ?? randomUUID();
+          if (existing) {
+            await client.query("update assessments set template_id=$2,version=version+1 where id=$1", [assessmentId, data.templateId]);
+            await client.query("delete from indicator_nodes where assessment_id=$1", [assessmentId]);
+          } else {
+            await client.query("insert into assessments (id,cycle_id,employee_no,template_id) values ($1,$2,$3,$4)", [assessmentId, data.cycleId, targetNo, data.templateId]);
+          }
+          const idByCode = new Map(nodes.map((indicator) => [indicator.nodeCode, randomUUID()]));
+          for (const indicator of nodes) await client.query("insert into indicator_nodes (id,assessment_id,parent_id,node_code,name,description,scoring_rule,max_score,sort_order) values ($1,$2,$3,$4,$5,$6,$7,$8,$9)", [idByCode.get(indicator.nodeCode), assessmentId, indicator.parentCode ? idByCode.get(indicator.parentCode) : null, indicator.nodeCode, indicator.name, indicator.description, indicator.scoringRule, indicator.maxScore, indicator.sortOrder]);
+          await client.query("insert into audit_logs (id,actor_employee_no,action,entity_type,entity_id,detail) values ($1,$2,'MATCH_TEMPLATE','ASSESSMENT',$3,$4)", [randomUUID(), actor.employeeNo, assessmentId, JSON.stringify({ employeeNo: targetNo, templateId: data.templateId })]);
+        }
+        await client.query("commit");
+      } catch (error) { await client.query("rollback"); throw error; } finally { client.release(); }
       return response({ assigned: targetNos.length });
     }
     if (path === "scorer-assignments") {
@@ -527,7 +573,7 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ path: str
     }
     const ownTree = path.match(/^my\/assessments\/([^/]+)\/tree$/);
     if (ownTree) {
-      const data = z.object({ version: z.number().int().positive(), nodes: z.array(node).min(2).max(300) }).parse(await body(req));
+      const data = z.object({ version: z.number().int().positive(), nodes: z.array(draftNode).max(300) }).parse(await body(req));
       return response(await saveOwnIndicatorTree(actor, id.parse(ownTree[1]), data.version, data.nodes));
     }
     const task = path.match(/^scorer\/tasks\/([^/]+)$/);
@@ -561,6 +607,7 @@ export async function DELETE(req: NextRequest, ctx: { params: Promise<{ path: st
         if (entity === "employees") {
           const exists = await client.query("select employee_no from employees where employee_no=$1 for update", [targetId]);
           if (!exists.rows.length) throw new HttpError(404, "NOT_FOUND", "员工不存在");
+          await cleanTemplateReferencesForEmployees(client, [targetId], actor.employeeNo);
           await deleteAssessmentsForEmployees(client, [targetId]);
           await client.query("delete from admin_scopes where admin_employee_no=$1", [targetId]);
           await client.query("delete from sessions where employee_no=$1", [targetId]);
@@ -570,7 +617,7 @@ export async function DELETE(req: NextRequest, ctx: { params: Promise<{ path: st
         }
         if (entity === "cycles") await deleteCycles(client, [targetId]);
         if (entity === "subsidiaries" || entity === "companies") {
-          const subsidiaryRows = await client.query(entity === "subsidiaries" ? "select id from subsidiaries where id=$1 for update" : "select id from subsidiaries where company_id=$1 for update", [targetId]);
+          const subsidiaryRows = await client.query(entity === "subsidiaries" ? "select id,company_id from subsidiaries where id=$1 for update" : "select id,company_id from subsidiaries where company_id=$1 for update", [targetId]);
           if (entity === "subsidiaries" && !subsidiaryRows.rows.length) throw new HttpError(404, "NOT_FOUND", "子公司不存在");
           if (entity === "companies") {
             const company = await client.query("select id from companies where id=$1 for update", [targetId]);
@@ -582,6 +629,7 @@ export async function DELETE(req: NextRequest, ctx: { params: Promise<{ path: st
           if (employeeNos.includes(actor.employeeNo)) throw new HttpError(409, "SELF_DELETE", "不能删除当前登录的超级管理员所在组织");
           const cycleRows = await client.query(entity === "companies" ? "select id from cycles where company_id=$1" : "select c.id from cycles c join subsidiaries s on s.company_id=c.company_id where s.id=$1", [targetId]);
           await deleteCycles(client, cycleRows.rows.map((row) => row.id as string));
+          await cleanTemplateReferencesForEmployees(client, employeeNos, actor.employeeNo);
           await deleteAssessmentsForEmployees(client, employeeNos);
           if (employeeNos.length) {
             await client.query("delete from admin_scopes where admin_employee_no=any($1::text[])", [employeeNos]);
@@ -592,7 +640,11 @@ export async function DELETE(req: NextRequest, ctx: { params: Promise<{ path: st
           }
           if (subsidiaryIds.length) await client.query("delete from admin_scopes where subsidiary_id=any($1::text[])", [subsidiaryIds]);
           if (entity === "subsidiaries") await client.query("delete from subsidiaries where id=$1", [targetId]);
-          else { await client.query("delete from subsidiaries where company_id=$1", [targetId]); await client.query("delete from companies where id=$1", [targetId]); }
+          else {
+            await deleteTemplatesForCompanies(client, [targetId]);
+            await client.query("delete from subsidiaries where company_id=$1", [targetId]);
+            await client.query("delete from companies where id=$1", [targetId]);
+          }
         }
         await client.query("insert into audit_logs (id,actor_employee_no,action,entity_type,entity_id,detail) values ($1,$2,'DELETE',$3,$4,$5)", [randomUUID(), actor.employeeNo, entity.toUpperCase(), targetId, JSON.stringify({ confirmed: true })]);
         await client.query("commit");

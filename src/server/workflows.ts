@@ -77,9 +77,6 @@ export async function withIdempotency<T>(actor: Actor, key: string | null, paylo
 }
 
 export async function configureAssessment(actor: Actor, input: { cycleId: string; employeeNo: string; nodes: NewIndicator[]; scorers: string[]; templateId?: string | null; preserveExistingScorers?: boolean }) {
-  const mapped = input.nodes.map((node) => ({ id: node.nodeCode, parentId: node.parentCode, name: node.name, maxScore: node.maxScore }));
-  const errors = validateIndicatorTree(mapped);
-  if (errors.length) throw new HttpError(422, "INVALID_TREE", errors.join("；"));
   if (new Set(input.scorers).size !== input.scorers.length || input.scorers.includes(input.employeeNo)) {
     throw new HttpError(422, "INVALID_SCORERS", "打分人不可重复，且不可为本人");
   }
@@ -131,6 +128,25 @@ export async function publishCycle(actor: Actor, cycleId: string, key: string | 
       where e.status='ACTIVE' and not exists
       (select 1 from scorer_assignments sa where sa.cycle_id=$1 and sa.employee_no=e.employee_no and sa.status='ACTIVE') limit 10`, [cycleId]);
     if (noScorers.rows.length) throw new HttpError(422, "MISSING_SCORERS", `以下员工尚未分配打分人：${noScorers.rows.map((row) => row.employee_no).join("、")}`);
+    const indicatorRows = await client.query(`select a.id as "assessmentId", a.employee_no as "employeeNo", n.node_code as "nodeCode",
+      n.parent_id, parent.node_code as "parentCode", n.name, n.max_score as "maxScore"
+      from assessments a left join indicator_nodes n on n.assessment_id=a.id
+      left join indicator_nodes parent on parent.id=n.parent_id
+      where a.cycle_id=$1 order by a.id,n.sort_order,n.node_code`, [cycleId]);
+    const nodesByAssessment = new Map<string, { id: string; parentId: string | null; name: string; maxScore: number }[]>();
+    const employeeByAssessment = new Map<string, string>();
+    for (const row of indicatorRows.rows) {
+      const assessmentId = row.assessmentId as string;
+      employeeByAssessment.set(assessmentId, row.employeeNo as string);
+      const nodes = nodesByAssessment.get(assessmentId) ?? [];
+      if (row.nodeCode !== null) nodes.push({ id: row.nodeCode as string, parentId: row.parentCode as string | null, name: row.name as string, maxScore: Number(row.maxScore) });
+      nodesByAssessment.set(assessmentId, nodes);
+    }
+    const invalidTrees = [...nodesByAssessment.entries()]
+      .map(([assessmentId, nodes]) => ({ employeeNo: employeeByAssessment.get(assessmentId)!, errors: validateIndicatorTree(nodes) }))
+      .filter((tree) => tree.errors.length)
+      .slice(0, 10);
+    if (invalidTrees.length) throw new HttpError(422, "INVALID_INDICATOR_TREES", invalidTrees.map((tree) => `${tree.employeeNo}：${tree.errors.join("、")}`).join("；"));
     await client.query("update cycles set status='ACTIVE' where id=$1", [cycleId]);
     await audit(client, actor, "PUBLISH", "CYCLE", cycleId);
     return { id: cycleId, status: "ACTIVE" };
@@ -141,7 +157,7 @@ export async function saveSelf(actor: Actor, assessmentId: string, expectedVersi
   return inTransaction(async (client) => {
     const assessment = await assessmentForUpdate(client, assessmentId);
     if (assessment.employeeNo !== actor.employeeNo) throw new HttpError(403, "FORBIDDEN", "只能填写自己的考核单");
-    if (!["DRAFT", "ACTIVE"].includes(assessment.cycleStatus) || !["DRAFT", "RETURNED"].includes(assessment.status)) throw new HttpError(409, "LOCKED", "当前考核单不可编辑");
+    if (assessment.cycleStatus !== "ACTIVE" || !["DRAFT", "RETURNED"].includes(assessment.status)) throw new HttpError(409, "LOCKED", "考核周期发布后才可填写自评");
     assertVersion(assessment.version, expectedVersion);
     const nodeIds = values.map((value) => value.nodeId);
     const valid = await client.query("select id from indicator_nodes where assessment_id=$1 and id=any($2::text[])", [assessmentId, nodeIds]);
@@ -156,13 +172,10 @@ export async function saveSelf(actor: Actor, assessmentId: string, expectedVersi
 }
 
 export async function saveOwnIndicatorTree(actor: Actor, assessmentId: string, expectedVersion: number, nodes: NewIndicator[]) {
-  const mapped = nodes.map((node) => ({ id: node.nodeCode, parentId: node.parentCode, name: node.name, maxScore: node.maxScore }));
-  const errors = validateIndicatorTree(mapped);
-  if (errors.length) throw new HttpError(422, "INVALID_TREE", errors.join("；"));
   return inTransaction(async (client) => {
     const assessment = await assessmentForUpdate(client, assessmentId);
     if (assessment.employeeNo !== actor.employeeNo) throw new HttpError(403, "FORBIDDEN", "只能修改自己的考核单");
-    if (!["DRAFT", "ACTIVE"].includes(assessment.cycleStatus) || !["DRAFT", "RETURNED"].includes(assessment.status)) throw new HttpError(409, "LOCKED", "当前考核单不可编辑");
+    if (assessment.cycleStatus !== "DRAFT" || assessment.status !== "DRAFT") throw new HttpError(409, "LOCKED", "仅草稿周期可保存指标草稿");
     assertVersion(assessment.version, expectedVersion);
     await client.query("delete from indicator_nodes where assessment_id=$1", [assessmentId]);
     const idByCode = new Map(nodes.map((node) => [node.nodeCode, randomUUID()]));
@@ -177,7 +190,7 @@ export async function submitSelf(actor: Actor, assessmentId: string, expectedVer
   return withIdempotency(actor, key, { assessmentId, expectedVersion, action: "SUBMIT_SELF" }, async (client) => {
     const assessment = await assessmentForUpdate(client, assessmentId);
     if (assessment.employeeNo !== actor.employeeNo) throw new HttpError(403, "FORBIDDEN", "只能提交自己的考核单");
-    if (!["DRAFT", "ACTIVE"].includes(assessment.cycleStatus) || !["DRAFT", "RETURNED"].includes(assessment.status)) throw new HttpError(409, "LOCKED", "当前考核单不可提交");
+    if (assessment.cycleStatus !== "ACTIVE" || !["DRAFT", "RETURNED"].includes(assessment.status)) throw new HttpError(409, "LOCKED", "考核周期发布后才可提交自评");
     assertVersion(assessment.version, expectedVersion);
     await client.query("update assessments set status='SUBMITTED', version=version+1, submitted_at=now() where id=$1", [assessmentId]);
     await audit(client, actor, "SUBMIT_SELF", "ASSESSMENT", assessmentId);
@@ -191,6 +204,7 @@ export async function returnAssessment(actor: Actor, assessmentId: string, expec
     const assessment = await assessmentForUpdate(client, assessmentId);
     assertAdmin(actor, assessment.subsidiaryId);
     if (assessment.status !== "SUBMITTED") throw new HttpError(409, "NOT_SUBMITTED", "只能退回待预审考核单");
+    if (assessment.cycleStatus !== "ACTIVE") throw new HttpError(409, "CYCLE_LOCKED", "考核周期发布后才可审核");
     assertVersion(assessment.version, expectedVersion);
     const ids = feedback.map((item) => item.nodeId);
     const valid = await client.query("select id from indicator_nodes where assessment_id=$1 and id=any($2::text[])", [assessmentId, ids]);
@@ -209,7 +223,7 @@ export async function approveAssessment(actor: Actor, assessmentId: string, expe
     const assessment = await assessmentForUpdate(client, assessmentId);
     assertAdmin(actor, assessment.subsidiaryId);
     if (assessment.status !== "SUBMITTED") throw new HttpError(409, "NOT_SUBMITTED", "只能通过待预审考核单");
-    if (!["DRAFT", "ACTIVE"].includes(assessment.cycleStatus)) throw new HttpError(409, "CYCLE_LOCKED", "当前考核周期不可审核");
+    if (assessment.cycleStatus !== "ACTIVE") throw new HttpError(409, "CYCLE_LOCKED", "考核周期发布后才可审核");
     assertVersion(assessment.version, expectedVersion);
     const assignments = await client.query("select scorer_employee_no as \"scorerEmployeeNo\" from scorer_assignments where cycle_id=$1 and employee_no=$2 and status='ACTIVE' order by scorer_employee_no for update", [assessment.cycleId, assessment.employeeNo]);
     if (!assignments.rows.length) throw new HttpError(422, "NO_SCORERS", "请先配置打分人");
@@ -234,7 +248,7 @@ async function taskForUpdate(client: PoolClient, actor: Actor, taskId: string) {
 export async function saveScore(actor: Actor, taskId: string, expectedVersion: number, items: { nodeId: string; score: number; comment: string }[]) {
   return inTransaction(async (client) => {
     const task = await taskForUpdate(client, actor, taskId);
-    if (task.status !== "PENDING" || task.assessmentStatus !== "SCORING" || !["DRAFT", "ACTIVE"].includes(task.cycleStatus)) throw new HttpError(409, "LOCKED", "评分已提交或考核周期已停止，不能再修改");
+    if (task.status !== "PENDING" || task.assessmentStatus !== "SCORING" || task.cycleStatus !== "ACTIVE") throw new HttpError(409, "LOCKED", "评分已提交或考核周期未发布/已停止，不能再修改");
     assertVersion(task.version, expectedVersion);
     const ids = items.map((item) => item.nodeId);
     if (new Set(ids).size !== ids.length) throw new HttpError(422, "DUPLICATE_NODES", "打分项不可重复");
@@ -259,7 +273,7 @@ export async function saveScore(actor: Actor, taskId: string, expectedVersion: n
 export async function submitScore(actor: Actor, taskId: string, expectedVersion: number, key: string | null) {
   return withIdempotency(actor, key, { taskId, expectedVersion, action: "SUBMIT_SCORE" }, async (client) => {
     const task = await taskForUpdate(client, actor, taskId);
-    if (task.status !== "PENDING" || task.assessmentStatus !== "SCORING" || !["DRAFT", "ACTIVE"].includes(task.cycleStatus)) throw new HttpError(409, "LOCKED", "评分已提交或考核周期已停止，不能再提交");
+    if (task.status !== "PENDING" || task.assessmentStatus !== "SCORING" || task.cycleStatus !== "ACTIVE") throw new HttpError(409, "LOCKED", "评分已提交或考核周期未发布/已停止，不能再提交");
     assertVersion(task.version, expectedVersion);
     const leaves = await client.query(`select n.id, n.max_score as "maxScore", i.score from indicator_nodes n
       left join score_items i on i.node_id=n.id and i.task_id=$2

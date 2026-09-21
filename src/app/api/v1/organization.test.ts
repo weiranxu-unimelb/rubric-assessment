@@ -59,20 +59,20 @@ describe("subsidiary management", () => {
     expect(query).toHaveBeenCalledWith(expect.stringContaining("update cycles set name=$2"), expect.arrayContaining([companyId, "2026 年度考核（修订）"]));
   });
 
-  it("allows an administrator to approve a submitted assessment in a draft cycle", async () => {
+  it("rejects assessment approval while its cycle is still a draft", async () => {
     clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
-    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [{ key: "review-key" }], rowCount: 1 }).mockResolvedValueOnce({ rows: [{ id: companyId, employeeNo: "E1001", status: "SUBMITTED", version: 3, subsidiaryId, cycleStatus: "DRAFT" }] }).mockResolvedValueOnce({ rows: [{ scorerEmployeeNo: "E1002" }] });
+    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [{ key: "review-key" }], rowCount: 1 }).mockResolvedValueOnce({ rows: [{ id: companyId, employeeNo: "E1001", status: "SUBMITTED", version: 3, subsidiaryId, cycleStatus: "DRAFT" }] });
     const request = new NextRequest(`http://localhost:3000/api/v1/admin/assessments/${companyId}/approve`, {
       method: "POST", headers: { origin: "http://localhost:3000", "content-type": "application/json", "idempotency-key": "review-key" }, body: JSON.stringify({ version: 3 }),
     });
 
     const response = await POST(request, { params: Promise.resolve({ path: ["admin", "assessments", companyId, "approve"] }) });
 
-    expect(response.status).toBe(200);
-    expect((await response.json()).status).toBe("SCORING");
+    expect(response.status).toBe(409);
+    expect((await response.json()).error.code).toBe("CYCLE_LOCKED");
   });
 
-  it("shows a scoring task as writable while its cycle is still draft", async () => {
+  it("rejects saving a score while its cycle is still a draft", async () => {
     clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
     clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [{ id: companyId, assessmentId: companyId, status: "PENDING", version: 2, assessmentStatus: "SCORING", cycleStatus: "DRAFT" }] }).mockResolvedValueOnce({ rows: [] });
     const request = new NextRequest(`http://localhost:3000/api/v1/scorer/tasks/${companyId}`, {
@@ -81,8 +81,41 @@ describe("subsidiary management", () => {
 
     const response = await PATCH(request, { params: Promise.resolve({ path: ["scorer", "tasks", companyId] }) });
 
+    expect(response.status).toBe(409);
+    expect((await response.json()).error.code).toBe("LOCKED");
+  });
+
+  it("lets an employee store an incomplete indicator tree while its cycle is a draft", async () => {
+    clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
+    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ id: companyId, employeeNo: actor.employeeNo, status: "DRAFT", version: 1, subsidiaryId, cycleStatus: "DRAFT" }] });
+    const request = new NextRequest(`http://localhost:3000/api/v1/my/assessments/${companyId}/tree`, {
+      method: "PATCH", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
+      body: JSON.stringify({ version: 1, nodes: [
+        { nodeCode: "R", parentCode: null, name: "年度考核", description: "", scoringRule: "", maxScore: 100, sortOrder: 0 },
+        { nodeCode: "L1", parentCode: "R", name: "", description: "", scoringRule: "", maxScore: 0, sortOrder: 1 },
+      ] }),
+    });
+
+    const response = await PATCH(request, { params: Promise.resolve({ path: ["my", "assessments", companyId, "tree"] }) });
+
     expect(response.status).toBe(200);
-    expect((await response.json()).version).toBe(3);
+    expect((await response.json()).version).toBe(2);
+  });
+
+  it("rejects self-evaluation content while its cycle is still a draft", async () => {
+    clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
+    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ id: companyId, employeeNo: actor.employeeNo, status: "DRAFT", version: 1, subsidiaryId, cycleStatus: "DRAFT" }] });
+    const request = new NextRequest(`http://localhost:3000/api/v1/my/assessments/${companyId}`, {
+      method: "PATCH", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
+      body: JSON.stringify({ version: 1, values: [] }),
+    });
+
+    const response = await PATCH(request, { params: Promise.resolve({ path: ["my", "assessments", companyId] }) });
+
+    expect(response.status).toBe(409);
+    expect((await response.json()).error.code).toBe("LOCKED");
   });
 
   it("rejects changes to an already submitted score", async () => {
@@ -273,21 +306,32 @@ describe("subsidiary management", () => {
     expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining("insert into indicator_templates"), expect.any(Array));
   });
 
-  it("rejects an employee tree that does not total 100 before opening a transaction", async () => {
-    const assessmentId = "33333333-3333-4333-8333-333333333333";
-    const request = new NextRequest(`http://localhost:3000/api/v1/my/assessments/${assessmentId}/tree`, {
-      method: "PATCH", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
-      body: JSON.stringify({ version: 1, nodes: [{ nodeCode: "R", parentCode: null, name: "年度考核", description: "", scoringRule: "", maxScore: 100, sortOrder: 0 }, { nodeCode: "L1", parentCode: "R", name: "一级指标", description: "", scoringRule: "", maxScore: 90, sortOrder: 1 }] }),
+  it("rejects publishing a cycle whose saved indicator tree does not total 100", async () => {
+    clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
+    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ key: "publish-key" }], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ id: companyId, status: "DRAFT" }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [
+        { assessmentId: "assessment-1", employeeNo: "E1001", nodeCode: "R", parentCode: null, name: "年度考核", maxScore: 100 },
+        { assessmentId: "assessment-1", employeeNo: "E1001", nodeCode: "L1", parentCode: "R", name: "一级指标", maxScore: 90 },
+      ] });
+    const request = new NextRequest(`http://localhost:3000/api/v1/cycles/${companyId}/publish`, {
+      method: "POST", headers: { origin: "http://localhost:3000", "content-type": "application/json", "idempotency-key": "publish-key" }, body: "{}",
     });
 
-    const response = await PATCH(request, { params: Promise.resolve({ path: ["my", "assessments", assessmentId, "tree"] }) });
+    const response = await POST(request, { params: Promise.resolve({ path: ["cycles", companyId, "publish"] }) });
 
     expect(response.status).toBe(422);
-    expect(connect).not.toHaveBeenCalled();
+    expect((await response.json()).error.code).toBe("INVALID_INDICATOR_TREES");
   });
 
   it("accepts legacy 32-character assessment ids at the tree endpoint", async () => {
     const legacyAssessmentId = "84c64e3af8ad066a76a63c8698a33af9";
+    clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
+    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ id: legacyAssessmentId, employeeNo: actor.employeeNo, status: "DRAFT", version: 1, subsidiaryId, cycleStatus: "DRAFT" }] });
     const request = new NextRequest(`http://localhost:3000/api/v1/my/assessments/${legacyAssessmentId}/tree`, {
       method: "PATCH", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
       body: JSON.stringify({ version: 1, nodes: [{ nodeCode: "R", parentCode: null, name: "年度考核", description: "", scoringRule: "", maxScore: 100, sortOrder: 0 }, { nodeCode: "L1", parentCode: "R", name: "一级指标", description: "", scoringRule: "", maxScore: 90, sortOrder: 1 }] }),
@@ -295,15 +339,18 @@ describe("subsidiary management", () => {
 
     const response = await PATCH(request, { params: Promise.resolve({ path: ["my", "assessments", legacyAssessmentId, "tree"] }) });
 
-    expect(response.status).toBe(422);
-    expect((await response.json()).error.code).toBe("INVALID_TREE");
-    expect(connect).not.toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect((await response.json()).version).toBe(2);
   });
 
   it("replaces a draft assessment with a structure-only template without requiring indicator content or a score", async () => {
-    query.mockResolvedValueOnce({ rows: [{ id: companyId, layout: { columns: [{ id: "indicator", label: "指标名称", type: "TEXT", required: true }], rows: [] } }] }).mockResolvedValueOnce({ rows: [{ employeeNo: "E1001", subsidiaryId, assessmentId: "existing-draft", assessmentStatus: "DRAFT" }] });
+    query.mockResolvedValueOnce({ rows: [{ id: companyId, companyId, layout: { columns: [{ id: "indicator", label: "指标名称", type: "TEXT", required: true }], rows: [] } }] });
     clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
-    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [{ subsidiaryId, companyId }] }).mockResolvedValueOnce({ rows: [{ companyId, status: "DRAFT" }] }).mockResolvedValueOnce({ rows: [{ id: "existing-draft", status: "DRAFT" }] });
+    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ id: companyId, status: "DRAFT" }] })
+      .mockResolvedValueOnce({ rows: [{ companyId, layout: { columns: [{ id: "indicator", label: "指标名称", type: "TEXT", required: true }], rows: [] } }] })
+      .mockResolvedValueOnce({ rows: [{ employeeNo: "E1001", subsidiaryId, companyId }] })
+      .mockResolvedValueOnce({ rows: [{ id: "existing-draft", employeeNo: "E1001", status: "DRAFT" }] });
     const request = new NextRequest("http://localhost:3000/api/v1/template-assignments", {
       method: "POST", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
       body: JSON.stringify({ cycleId: companyId, templateId: companyId, employeeNos: ["E1001"] }),
@@ -317,9 +364,14 @@ describe("subsidiary management", () => {
   });
 
   it("creates a visible draft assessment and preserves a blank template tree when first matched", async () => {
-    query.mockResolvedValueOnce({ rows: [{ id: companyId, layout: { columns: [{ id: "indicator", label: "指标名称", type: "TEXT", required: true }], rows: [], tree: [{ name: "", description: "", scoringRule: "", maxScore: null, children: [{ name: "", description: "", scoringRule: "", maxScore: null }] }] } }] }).mockResolvedValueOnce({ rows: [{ employeeNo: "E1001", subsidiaryId, assessmentId: null }] });
+    const layout = { columns: [{ id: "indicator", label: "指标名称", type: "TEXT", required: true }], rows: [], tree: [{ name: "", description: "", scoringRule: "", maxScore: null, children: [{ name: "", description: "", scoringRule: "", maxScore: null }] }] };
+    query.mockResolvedValueOnce({ rows: [{ id: companyId, companyId, layout }] });
     clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
-    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [{ subsidiaryId, companyId }] }).mockResolvedValueOnce({ rows: [{ companyId, status: "DRAFT" }] }).mockResolvedValueOnce({ rows: [] });
+    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ id: companyId, status: "DRAFT" }] })
+      .mockResolvedValueOnce({ rows: [{ companyId, layout }] })
+      .mockResolvedValueOnce({ rows: [{ employeeNo: "E1001", subsidiaryId, companyId }] })
+      .mockResolvedValueOnce({ rows: [] });
     const request = new NextRequest("http://localhost:3000/api/v1/template-assignments", { method: "POST", headers: { origin: "http://localhost:3000", "content-type": "application/json" }, body: JSON.stringify({ cycleId: companyId, templateId: companyId, employeeNos: ["E1001"] }) });
 
     const response = await POST(request, { params: Promise.resolve({ path: ["template-assignments"] }) });
@@ -327,6 +379,31 @@ describe("subsidiary management", () => {
     expect(response.status).toBe(200);
     expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining("insert into assessments"), expect.any(Array));
     expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining("insert into indicator_nodes"), expect.arrayContaining([expect.any(String), expect.any(String), expect.anything(), expect.any(String), "待填写一级指标 1"]));
+  });
+
+  it("rolls back the complete template match when rebuilding an assessment fails", async () => {
+    const layout = { columns: [{ id: "indicator", label: "指标名称", type: "TEXT", required: true }], rows: [] };
+    query.mockResolvedValueOnce({ rows: [{ id: companyId, companyId, layout }] });
+    clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
+    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ id: companyId, status: "DRAFT" }] })
+      .mockResolvedValueOnce({ rows: [{ companyId, layout }] })
+      .mockResolvedValueOnce({ rows: [{ employeeNo: "E1001", subsidiaryId, companyId }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockRejectedValueOnce(new Error("indicator insert failed"));
+    const request = new NextRequest("http://localhost:3000/api/v1/template-assignments", {
+      method: "POST", headers: { origin: "http://localhost:3000", "content-type": "application/json" }, body: JSON.stringify({ cycleId: companyId, templateId: companyId, employeeNos: ["E1001"] }),
+    });
+
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const response = await POST(request, { params: Promise.resolve({ path: ["template-assignments"] }) });
+    consoleError.mockRestore();
+
+    expect(response.status).toBe(500);
+    expect(clientQuery).toHaveBeenCalledWith("rollback");
+    expect(clientQuery).not.toHaveBeenCalledWith("commit");
   });
 
   it("rejects a scorer relationship that assigns an employee to score themselves", async () => {
