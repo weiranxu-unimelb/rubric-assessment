@@ -9,6 +9,7 @@ import { loadState } from "@/server/state";
 import { isAllowedOrigin } from "@/server/origin";
 import { approveAssessment, configureAssessment, HttpError, publishCycle, returnAssessment, saveOwnIndicatorTree, saveScore, saveSelf, submitScore, submitSelf } from "@/server/workflows";
 import { buildIndicatorNodes, validateIndicatorHierarchy, type IndicatorGroupDraft } from "@/lib/indicator-hierarchy";
+import { distributeScorerWeights, validateScorerWeights } from "@/server/domain";
 
 export const runtime = "nodejs";
 const text = z.string().trim().min(1).max(200);
@@ -19,6 +20,8 @@ const id = z.string().regex(/^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a
 const employeeNo = z.string().trim().min(1).max(40);
 const newPassword = z.string().min(10).max(128).regex(/^(?=.*[A-Za-z])(?=.*\d).+$/, "密码需同时包含字母和数字");
 const score = z.number().finite().min(0).max(100);
+const scorerWeight = z.number().finite().gt(0).max(100).refine((value) => Math.abs(value * 100 - Math.round(value * 100)) < 0.000001, "权重最多保留两位小数");
+const scorerAssignmentInput = z.object({ scorerEmployeeNo: employeeNo, weight: scorerWeight });
 const node = z.object({ nodeCode: text, parentCode: text.nullable(), name: text, description: z.string().max(2000).default(""), scoringRule: z.string().max(2000).default(""), maxScore: score, sortOrder: z.number().int().default(0) });
 const draftNode = z.object({ nodeCode: text, parentCode: text.nullable(), name: z.string().max(200).default(""), description: z.string().max(2000).default(""), scoringRule: z.string().max(2000).default(""), maxScore: score, sortOrder: z.number().int().default(0) });
 const employeeImportRow = z.object({ employeeNo, name: text, subsidiaryName: text, department: text, position: z.string().max(200), phone: z.string().max(40), initialPassword: newPassword });
@@ -51,6 +54,15 @@ function assessmentNodesFromTemplate(layout: z.infer<typeof templateLayout>) {
   }
   const presetRows = layout.rows.length ? layout.rows : [{ id: "default", label: "" }];
   return [{ nodeCode: "R", parentCode: null, name: "年度考核", description: "", scoringRule: "", maxScore: 100, sortOrder: 0 }, ...presetRows.map((row, index) => ({ nodeCode: `T${index + 1}`, parentCode: "R", name: row.label.trim() || `待填写指标 ${index + 1}`, description: "", scoringRule: "", maxScore: index === presetRows.length - 1 ? 100 - Number((100 / presetRows.length * index).toFixed(2)) : Number((100 / presetRows.length).toFixed(2)), sortOrder: index + 1 }))];
+}
+
+function normalizeScorerAssignments(scorerEmployeeNos: string[], configured?: z.infer<typeof scorerAssignmentInput>[]) {
+  const assignments = configured ?? scorerEmployeeNos.map((scorerEmployeeNo, index) => ({ scorerEmployeeNo, weight: distributeScorerWeights(scorerEmployeeNos.length)[index] }));
+  const assignedNos = assignments.map((assignment) => assignment.scorerEmployeeNo);
+  if (!assignments.length || new Set(assignedNos).size !== assignedNos.length) throw new HttpError(422, "INVALID_SCORERS", "至少需要一位不重复的打分人");
+  const errors = validateScorerWeights(assignments.map((assignment) => assignment.weight));
+  if (errors.length) throw new HttpError(422, "INVALID_SCORER_WEIGHTS", errors.join("；"));
+  return assignments;
 }
 
 function response(data: unknown, status = 200) { return NextResponse.json(data, { status }); }
@@ -151,7 +163,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ path: strin
       adminRequired(actor);
       if (path === "templates/employees") return excelResponse([["工号", "姓名", "公司名称", "部门", "职位", "手机号", "初始密码"], ["E1001", "张三", "请填公司名称", "人力资源部", "人事专员", "", "至少10位密码"]], "员工导入模板");
       if (path === "templates/indicators") return excelResponse([["一级指标", "一级考核内容", "一级计分规则", "一级分值", "二级指标", "二级考核内容", "二级计分规则", "二级分值"], ["人力资源基础业务规范开展", "完成基础人力资源工作", "按完成质量与时效评分", 25, "", "", "", ""], ["人才引进及任务服务支持", "完成招聘及服务支持", "按任务完成情况评分", 30, "", "", "", ""], ["岗位绩效考核协同及业务能力提升", "协同完成考核工作", "按协同质量评分", 45, "招聘计划执行", "完成招聘计划", "按招聘达成率评分", 25], ["岗位绩效考核协同及业务能力提升", "", "", 45, "考核协同", "完成绩效协同", "按协同及时性评分", 20]], "指标导入模板");
-      return excelResponse([["被打分人工号", "打分人工号"], ["E1001", "E1002"], ["E1001", "E1003"]], "打分人关系模板");
+      return excelResponse([["被打分人工号", "打分人工号", "权重（%）"], ["E1001", "E1002", 60], ["E1001", "E1003", 40]], "打分人关系模板");
     }
     if (path === "export/employees" || path === "export/scorers" || path === "export/indicators") {
       adminRequired(actor);
@@ -162,8 +174,8 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ path: strin
       }
       const cycleId = id.parse(req.nextUrl.searchParams.get("cycleId"));
       if (path === "export/scorers") {
-        const result = await pool.query(`select sa.employee_no,sa.scorer_employee_no,sa.status from scorer_assignments sa join employees e on e.employee_no=sa.employee_no where sa.cycle_id=$1 and ($2::text[] is null or e.subsidiary_id=any($2::text[])) order by sa.employee_no,sa.scorer_employee_no`, [cycleId, scope]);
-        return excelResponse([["被打分人工号", "打分人工号", "状态"], ...result.rows.map((r) => [r.employee_no, r.scorer_employee_no, r.status])], "打分人关系");
+        const result = await pool.query(`select sa.employee_no,sa.scorer_employee_no,sa.weight,sa.status from scorer_assignments sa join employees e on e.employee_no=sa.employee_no where sa.cycle_id=$1 and ($2::text[] is null or e.subsidiary_id=any($2::text[])) order by sa.employee_no,sa.scorer_employee_no`, [cycleId, scope]);
+        return excelResponse([["被打分人工号", "打分人工号", "权重（%）", "状态"], ...result.rows.map((r) => [r.employee_no, r.scorer_employee_no, Number(r.weight), r.status])], "打分人关系");
       }
       const result = await pool.query(`select a.employee_no,n.node_code,p.node_code as parent_code,n.name,n.description,n.scoring_rule,n.max_score,n.sort_order from indicator_nodes n join assessments a on a.id=n.assessment_id join employees e on e.employee_no=a.employee_no left join indicator_nodes p on p.id=n.parent_id where a.cycle_id=$1 and ($2::text[] is null or e.subsidiary_id=any($2::text[])) order by a.employee_no,n.sort_order`, [cycleId, scope]);
       return excelResponse([["工号", "指标编码", "父指标编码", "名称", "考核内容", "计分规则", "分值", "排序"], ...result.rows.map((r) => [r.employee_no, r.node_code, r.parent_code, r.name, r.description, r.scoring_rule, Number(r.max_score), r.sort_order])], "指标配置");
@@ -174,11 +186,11 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ path: strin
       if (!cycle.rows[0]) throw new HttpError(404, "NOT_FOUND", "考核周期不存在");
       if (path === "export/detail") {
         superRequired(actor);
-        const result = await pool.query(`select a.employee_no, e.name as employee_name, s.name as subsidiary_name, t.scorer_employee_no, scorer.name as scorer_name, n.node_code, n.name as indicator_name, i.score, i.comment, a.final_score
+        const result = await pool.query(`select a.employee_no, e.name as employee_name, s.name as subsidiary_name, t.scorer_employee_no, scorer.name as scorer_name, t.weight, t.total_score, t.total_score * t.weight / 100 as weighted_score, n.node_code, n.name as indicator_name, i.score, i.comment, a.final_score
           from assessments a join employees e on e.employee_no=a.employee_no join subsidiaries s on s.id=e.subsidiary_id
           join score_tasks t on t.assessment_id=a.id join employees scorer on scorer.employee_no=t.scorer_employee_no
           join score_items i on i.task_id=t.id join indicator_nodes n on n.id=i.node_id where a.cycle_id=$1 order by s.name,e.name,scorer.name,n.sort_order`, [cycleId]);
-        return excelResponse([["工号", "姓名", "子公司", "打分人工号", "打分人", "指标编码", "指标", "得分", "评语", "最终总分"], ...result.rows.map((r) => [r.employee_no, r.employee_name, r.subsidiary_name, r.scorer_employee_no, r.scorer_name, r.node_code, r.indicator_name, Number(r.score), r.comment, r.final_score === null ? null : Number(r.final_score)])], "考核评分明细");
+        return excelResponse([["工号", "姓名", "子公司", "打分人工号", "打分人", "权重（%）", "打分人总分", "加权贡献", "指标编码", "指标", "得分", "评语", "最终总分"], ...result.rows.map((r) => [r.employee_no, r.employee_name, r.subsidiary_name, r.scorer_employee_no, r.scorer_name, Number(r.weight), Number(r.total_score), Number(r.weighted_score), r.node_code, r.indicator_name, Number(r.score), r.comment, r.final_score === null ? null : Number(r.final_score)])], "考核评分明细");
       }
       adminRequired(actor);
       const scope = actor.isSuperAdmin ? null : actor.adminSubsidiaryIds;
@@ -308,14 +320,23 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
     }
     if (path === "scorer-assignments") {
       adminRequired(actor);
-      const data = z.object({ cycleId: id, employeeNo, scorerEmployeeNos: z.array(employeeNo).min(1).max(20) }).parse(await body(req));
-      if (data.scorerEmployeeNos.includes(data.employeeNo) || new Set(data.scorerEmployeeNos).size !== data.scorerEmployeeNos.length) throw new HttpError(422, "INVALID_SCORERS", "打分人不可重复或为本人");
-      const target = await pool.query("select e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=$2 and e.status='ACTIVE' and (exists (select 1 from assessments a where a.cycle_id=$1 and a.employee_no=e.employee_no and a.status='DRAFT') or exists (select 1 from template_assignments ta where ta.cycle_id=$1 and ta.employee_no=e.employee_no))", [data.cycleId, data.employeeNo]);
+      const data = z.object({ cycleId: id, employeeNo, scorerEmployeeNos: z.array(employeeNo).min(1).max(20).optional(), scorerAssignments: z.array(scorerAssignmentInput).min(1).max(20).optional() }).parse(await body(req));
+      const assignments = normalizeScorerAssignments(data.scorerEmployeeNos ?? data.scorerAssignments?.map((item) => item.scorerEmployeeNo) ?? [], data.scorerAssignments);
+      const scorerEmployeeNos = assignments.map((assignment) => assignment.scorerEmployeeNo);
+      if (scorerEmployeeNos.includes(data.employeeNo)) throw new HttpError(422, "INVALID_SCORERS", "打分人不可重复或为本人");
+      const target = await pool.query("select e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=$2 and e.status='ACTIVE' and exists (select 1 from assessments a where a.cycle_id=$1 and a.employee_no=e.employee_no and a.status='DRAFT')", [data.cycleId, data.employeeNo]);
       if (!target.rows[0] || !mayAdmin(actor, target.rows[0].subsidiaryId)) throw new HttpError(422, "ASSESSMENT_REQUIRED", "请先为该员工导入指标，或匹配指标模板");
-      const scorerRows = await pool.query("select e.employee_no as \"employeeNo\",e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=any($1::text[]) and e.status='ACTIVE'", [data.scorerEmployeeNos]);
-      if (scorerRows.rows.length !== data.scorerEmployeeNos.length || scorerRows.rows.some((scorer) => scorer.companyId !== target.rows[0].companyId || !mayAdmin(actor, scorer.subsidiaryId))) throw new HttpError(422, "INVALID_SCORERS", "打分人必须是在职员工，并且属于同一企业及管理员授权范围");
+      const scorerRows = await pool.query("select e.employee_no as \"employeeNo\",e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=any($1::text[]) and e.status='ACTIVE'", [scorerEmployeeNos]);
+      if (scorerRows.rows.length !== scorerEmployeeNos.length || scorerRows.rows.some((scorer) => scorer.companyId !== target.rows[0].companyId || !mayAdmin(actor, scorer.subsidiaryId))) throw new HttpError(422, "INVALID_SCORERS", "打分人必须是在职员工，并且属于同一企业及管理员授权范围");
       const client = await pool.connect();
-      try { await client.query("begin"); await client.query("delete from scorer_assignments where cycle_id=$1 and employee_no=$2", [data.cycleId, data.employeeNo]); for (const scorerNo of data.scorerEmployeeNos) await client.query("insert into scorer_assignments (id,cycle_id,employee_no,scorer_employee_no) values ($1,$2,$3,$4)", [randomUUID(), data.cycleId, data.employeeNo, scorerNo]); await client.query("commit"); } catch (error) { await client.query("rollback"); throw error; } finally { client.release(); }
+      try {
+        await client.query("begin");
+        const locked = await client.query("select a.id from assessments a join cycles c on c.id=a.cycle_id where a.cycle_id=$1 and a.employee_no=$2 and a.status='DRAFT' and c.status='DRAFT' for update of a,c", [data.cycleId, data.employeeNo]);
+        if (!locked.rows.length) throw new HttpError(409, "SCORER_ASSIGNMENTS_LOCKED", "仅草稿周期且员工尚未填报时可调整打分关系");
+        await client.query("delete from scorer_assignments where cycle_id=$1 and employee_no=$2", [data.cycleId, data.employeeNo]);
+        for (const assignment of assignments) await client.query("insert into scorer_assignments (id,cycle_id,employee_no,scorer_employee_no,weight) values ($1,$2,$3,$4,$5)", [randomUUID(), data.cycleId, data.employeeNo, assignment.scorerEmployeeNo, assignment.weight]);
+        await client.query("commit");
+      } catch (error) { await client.query("rollback"); throw error; } finally { client.release(); }
       return response({ ok: true });
     }
     if (path === "admin-scopes") {
@@ -326,8 +347,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
     }
     if (path === "assessments") {
       adminRequired(actor);
-      const data = z.object({ cycleId: id, employeeNo, nodes: z.array(node).min(1).max(300), scorers: z.array(employeeNo).min(1).max(20) }).parse(await body(req));
-      return response(await configureAssessment(actor, data), 201);
+      const data = z.object({ cycleId: id, employeeNo, nodes: z.array(node).min(1).max(300), scorers: z.array(employeeNo).min(1).max(20).optional(), scorerAssignments: z.array(scorerAssignmentInput).min(1).max(20).optional() }).parse(await body(req));
+      const scorers = normalizeScorerAssignments(data.scorers ?? data.scorerAssignments?.map((item) => item.scorerEmployeeNo) ?? [], data.scorerAssignments);
+      return response(await configureAssessment(actor, { ...data, scorers }), 201);
     }
     if (path === "imports/employees") {
       adminRequired(actor);
@@ -417,7 +439,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
       } else {
         throw new HttpError(422, "INVALID_TEMPLATE", "指标模板表头应为“一级指标”，请下载最新模板后导入");
       }
-      return response(await configureAssessment(actor, { cycleId, employeeNo: targetNo, nodes, scorers }));
+      return response(await configureAssessment(actor, { cycleId, employeeNo: targetNo, nodes, scorers: normalizeScorerAssignments(scorers) }));
     }
     if (path === "imports/scorers") {
       adminRequired(actor);
@@ -430,15 +452,30 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
       if (!sheet || sheet.rowCount > 501) throw new HttpError(422, "FILE", "单次最多导入 500 条关系");
       const cycle = await pool.query("select company_id,status from cycles where id=$1", [cycleId]);
       if (!cycle.rows[0] || cycle.rows[0].status !== "DRAFT") throw new HttpError(409, "CYCLE_NOT_DRAFT", "仅草稿周期可导入打分关系");
-      const pairs: { employeeNo: string; scorerNo: string }[] = []; const errors: string[] = []; const seen = new Set<string>();
+      const pairs: { employeeNo: string; scorerNo: string; weight: number | null }[] = []; const errors: string[] = []; const seen = new Set<string>();
       for (let i = 2; i <= sheet.rowCount; i++) {
-        const row = sheet.getRow(i); const target = String(row.getCell(1).text ?? "").trim(); const scorer = String(row.getCell(2).text ?? "").trim();
+        const row = sheet.getRow(i); const target = String(row.getCell(1).text ?? "").trim(); const scorer = String(row.getCell(2).text ?? "").trim(); const weightText = String(row.getCell(3).text ?? "").trim();
         if (!target && !scorer) continue;
         const parsed = z.tuple([employeeNo, employeeNo]).safeParse([target, scorer]);
         if (!parsed.success || target === scorer || seen.has(`${target}:${scorer}`)) { errors.push(`第 ${i} 行：工号无效、自评或关系重复`); continue; }
-        seen.add(`${target}:${scorer}`); pairs.push({ employeeNo: target, scorerNo: scorer });
+        const parsedWeight = weightText ? scorerWeight.safeParse(Number(weightText)) : { success: true as const, data: null };
+        if (!parsedWeight.success) { errors.push(`第 ${i} 行：权重必须大于 0、最多两位小数且不超过 100`); continue; }
+        seen.add(`${target}:${scorer}`); pairs.push({ employeeNo: target, scorerNo: scorer, weight: parsedWeight.data });
       }
       if (!pairs.length && !errors.length) errors.push("文件中没有有效数据行");
+      const pairsByEmployee = new Map<string, typeof pairs>();
+      for (const pair of pairs) pairsByEmployee.set(pair.employeeNo, [...(pairsByEmployee.get(pair.employeeNo) ?? []), pair]);
+      for (const [targetNo, targetPairs] of pairsByEmployee) {
+        const explicitWeights = targetPairs.filter((pair) => pair.weight !== null);
+        if (explicitWeights.length && explicitWeights.length !== targetPairs.length) {
+          errors.push(`${targetNo}：同一员工的打分权重需全部填写，或全部留空后由系统均分`);
+          continue;
+        }
+        const weights = explicitWeights.length ? targetPairs.map((pair) => pair.weight!) : distributeScorerWeights(targetPairs.length);
+        const weightErrors = validateScorerWeights(weights);
+        if (weightErrors.length) { errors.push(`${targetNo}：${weightErrors.join("；")}`); continue; }
+        targetPairs.forEach((pair, index) => { pair.weight = weights[index]; });
+      }
       const employeeNos = [...new Set(pairs.flatMap((p) => [p.employeeNo, p.scorerNo]))];
       const people = await pool.query(`select e.employee_no,e.subsidiary_id,s.company_id,e.status from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=any($1::text[])`, [employeeNos]);
       const byNo = new Map(people.rows.map((p) => [p.employee_no as string, p]));
@@ -454,9 +491,12 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
       const client = await pool.connect();
       try {
         await client.query("begin");
-        await client.query("select id from cycles where id=$1 and status='DRAFT' for update", [cycleId]);
+        const lockedCycle = await client.query("select id from cycles where id=$1 and status='DRAFT' for update", [cycleId]);
+        if (!lockedCycle.rows.length) throw new HttpError(409, "CYCLE_NOT_DRAFT", "仅草稿周期可导入打分关系");
+        const lockedAssessments = await client.query("select id from assessments where cycle_id=$1 and employee_no=any($2::text[]) and status='DRAFT' for update", [cycleId, targetNos]);
+        if (lockedAssessments.rows.length !== targetNos.length) throw new HttpError(409, "SCORER_ASSIGNMENTS_LOCKED", "存在已开始填报的员工，无法更新其打分关系");
         await client.query("delete from scorer_assignments where cycle_id=$1 and employee_no=any($2::text[])", [cycleId, targetNos]);
-        for (const pair of pairs) await client.query("insert into scorer_assignments (id,cycle_id,employee_no,scorer_employee_no) values ($1,$2,$3,$4)", [randomUUID(), cycleId, pair.employeeNo, pair.scorerNo]);
+        for (const pair of pairs) await client.query("insert into scorer_assignments (id,cycle_id,employee_no,scorer_employee_no,weight) values ($1,$2,$3,$4,$5)", [randomUUID(), cycleId, pair.employeeNo, pair.scorerNo, pair.weight]);
         await client.query("commit");
       } catch (error) { await client.query("rollback"); throw error; }
       finally { client.release(); }

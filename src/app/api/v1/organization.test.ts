@@ -72,6 +72,22 @@ describe("subsidiary management", () => {
     expect((await response.json()).error.code).toBe("CYCLE_LOCKED");
   });
 
+  it("freezes each configured scorer weight when approval creates score tasks", async () => {
+    clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
+    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ key: "weighted-approval-key" }], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ id: companyId, cycleId: companyId, employeeNo: "E1001", status: "SUBMITTED", version: 3, subsidiaryId, cycleStatus: "ACTIVE" }] })
+      .mockResolvedValueOnce({ rows: [{ scorerEmployeeNo: "E1002", weight: "60.00" }] });
+    const request = new NextRequest(`http://localhost:3000/api/v1/admin/assessments/${companyId}/approve`, {
+      method: "POST", headers: { origin: "http://localhost:3000", "content-type": "application/json", "idempotency-key": "weighted-approval-key" }, body: JSON.stringify({ version: 3 }),
+    });
+
+    const response = await POST(request, { params: Promise.resolve({ path: ["admin", "assessments", companyId, "approve"] }) });
+
+    expect(response.status).toBe(200);
+    expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining("insert into score_tasks"), expect.arrayContaining([companyId, "E1002", "60.00"]));
+  });
+
   it("rejects saving a score while its cycle is still a draft", async () => {
     clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
     clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [{ id: companyId, assessmentId: companyId, status: "PENDING", version: 2, assessmentStatus: "SCORING", cycleStatus: "DRAFT" }] }).mockResolvedValueOnce({ rows: [] });
@@ -313,6 +329,7 @@ describe("subsidiary management", () => {
       .mockResolvedValueOnce({ rows: [{ id: companyId, status: "DRAFT" }] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [
         { assessmentId: "assessment-1", employeeNo: "E1001", nodeCode: "R", parentCode: null, name: "年度考核", maxScore: 100 },
         { assessmentId: "assessment-1", employeeNo: "E1001", nodeCode: "L1", parentCode: "R", name: "一级指标", maxScore: 90 },
@@ -419,9 +436,23 @@ describe("subsidiary management", () => {
     expect(query).not.toHaveBeenCalled();
   });
 
+  it("rejects scorer weights that do not total 100 before querying employees", async () => {
+    const request = new NextRequest("http://localhost:3000/api/v1/scorer-assignments", {
+      method: "POST", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
+      body: JSON.stringify({ cycleId: companyId, employeeNo: "E1001", scorerAssignments: [{ scorerEmployeeNo: "E1002", weight: 60 }, { scorerEmployeeNo: "E1003", weight: 30 }] }),
+    });
+
+    const response = await POST(request, { params: Promise.resolve({ path: ["scorer-assignments"] }) });
+
+    expect(response.status).toBe(422);
+    expect((await response.json()).error.code).toBe("INVALID_SCORER_WEIGHTS");
+    expect(query).not.toHaveBeenCalled();
+  });
+
   it("allows scorer setup after a structure template is matched, before indicator content is filled", async () => {
-    query.mockImplementationOnce((sql: string) => { expect(sql).toContain("template_assignments"); return Promise.resolve({ rows: [{ subsidiaryId, companyId }] }); }).mockResolvedValueOnce({ rows: [{ employeeNo: "E1002", subsidiaryId, companyId }] });
+    query.mockImplementationOnce((sql: string) => { expect(sql).toContain("assessments"); return Promise.resolve({ rows: [{ subsidiaryId, companyId }] }); }).mockResolvedValueOnce({ rows: [{ employeeNo: "E1002", subsidiaryId, companyId }] });
     clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
+    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [{ id: "draft-assessment" }], rowCount: 1 });
     const request = new NextRequest("http://localhost:3000/api/v1/scorer-assignments", {
       method: "POST", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
       body: JSON.stringify({ cycleId: companyId, employeeNo: "E1001", scorerEmployeeNos: ["E1002"] }),
@@ -431,5 +462,6 @@ describe("subsidiary management", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ok: true });
+    expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining("insert into scorer_assignments"), expect.arrayContaining(["E1001", "E1002", 100]));
   });
 });

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import { pool } from "./db";
 import type { Actor } from "./auth";
-import { calculateFinalScore, validateIndicatorTree } from "./domain";
+import { calculateWeightedFinalScore, validateIndicatorTree, validateScorerWeights } from "./domain";
 
 export class HttpError extends Error {
   constructor(public status: number, public code: string, message: string) {
@@ -18,6 +18,11 @@ export type NewIndicator = {
   scoringRule: string;
   maxScore: number;
   sortOrder: number;
+};
+
+export type ScorerAssignmentInput = {
+  scorerEmployeeNo: string;
+  weight: number;
 };
 
 async function inTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -76,8 +81,11 @@ export async function withIdempotency<T>(actor: Actor, key: string | null, paylo
   });
 }
 
-export async function configureAssessment(actor: Actor, input: { cycleId: string; employeeNo: string; nodes: NewIndicator[]; scorers: string[]; templateId?: string | null; preserveExistingScorers?: boolean }) {
-  if (new Set(input.scorers).size !== input.scorers.length || input.scorers.includes(input.employeeNo)) {
+export async function configureAssessment(actor: Actor, input: { cycleId: string; employeeNo: string; nodes: NewIndicator[]; scorers: ScorerAssignmentInput[]; templateId?: string | null; preserveExistingScorers?: boolean }) {
+  const scorerEmployeeNos = input.scorers.map((scorer) => scorer.scorerEmployeeNo);
+  const weightErrors = validateScorerWeights(input.scorers.map((scorer) => scorer.weight));
+  if (weightErrors.length) throw new HttpError(422, "INVALID_SCORER_WEIGHTS", weightErrors.join("；"));
+  if (new Set(scorerEmployeeNos).size !== scorerEmployeeNos.length || scorerEmployeeNos.includes(input.employeeNo)) {
     throw new HttpError(422, "INVALID_SCORERS", "打分人不可重复，且不可为本人");
   }
   return inTransaction(async (client) => {
@@ -88,7 +96,7 @@ export async function configureAssessment(actor: Actor, input: { cycleId: string
     if (!cycle.rows[0] || cycle.rows[0].status !== "DRAFT") {
       throw new HttpError(409, "CYCLE_NOT_DRAFT", "仅草稿周期可配置指标");
     }
-    const scorers = input.scorers.length ? await client.query("select e.employee_no as \"employeeNo\", e.subsidiary_id as \"subsidiaryId\", s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=any($1::text[]) and e.status='ACTIVE'", [input.scorers]) : { rows: [] as { employeeNo: string; subsidiaryId: string; companyId: string }[] };
+    const scorers = input.scorers.length ? await client.query("select e.employee_no as \"employeeNo\", e.subsidiary_id as \"subsidiaryId\", s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=any($1::text[]) and e.status='ACTIVE'", [scorerEmployeeNos]) : { rows: [] as { employeeNo: string; subsidiaryId: string; companyId: string }[] };
     if (scorers.rows.length !== input.scorers.length || scorers.rows.some((row) => row.companyId !== target.rows[0].companyId || (!actor.isSuperAdmin && !actor.adminSubsidiaryIds.includes(row.subsidiaryId)))) {
       throw new HttpError(422, "INVALID_SCORERS", "打分人必须属于同一企业、在管理员授权范围内且为在职员工");
     }
@@ -107,8 +115,8 @@ export async function configureAssessment(actor: Actor, input: { cycleId: string
       await client.query("insert into indicator_nodes (id,assessment_id,parent_id,node_code,name,description,scoring_rule,max_score,sort_order) values ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
         [idByCode.get(node.nodeCode), id, node.parentCode ? idByCode.get(node.parentCode) : null, node.nodeCode, node.name, node.description, node.scoringRule, node.maxScore, node.sortOrder]);
     }
-    for (const scorerNo of input.scorers) {
-      await client.query("insert into scorer_assignments (id,cycle_id,employee_no,scorer_employee_no) values ($1,$2,$3,$4)", [randomUUID(), input.cycleId, input.employeeNo, scorerNo]);
+    for (const scorer of input.scorers) {
+      await client.query("insert into scorer_assignments (id,cycle_id,employee_no,scorer_employee_no,weight) values ($1,$2,$3,$4,$5)", [randomUUID(), input.cycleId, input.employeeNo, scorer.scorerEmployeeNo, scorer.weight]);
     }
     await audit(client, actor, assessmentId ? "RECONFIGURE" : "CREATE", "ASSESSMENT", id, { employeeNo: input.employeeNo });
     return { id };
@@ -128,6 +136,10 @@ export async function publishCycle(actor: Actor, cycleId: string, key: string | 
       where e.status='ACTIVE' and not exists
       (select 1 from scorer_assignments sa where sa.cycle_id=$1 and sa.employee_no=e.employee_no and sa.status='ACTIVE') limit 10`, [cycleId]);
     if (noScorers.rows.length) throw new HttpError(422, "MISSING_SCORERS", `以下员工尚未分配打分人：${noScorers.rows.map((row) => row.employee_no).join("、")}`);
+    const invalidWeights = await client.query(`select e.employee_no, coalesce(sum(sa.weight), 0) as "totalWeight"
+      from employees e left join scorer_assignments sa on sa.cycle_id=$1 and sa.employee_no=e.employee_no and sa.status='ACTIVE'
+      where e.status='ACTIVE' group by e.employee_no having coalesce(sum(sa.weight), 0) <> 100 limit 10`, [cycleId]);
+    if (invalidWeights.rows.length) throw new HttpError(422, "INVALID_SCORER_WEIGHTS", `以下员工的打分权重合计必须为 100.00：${invalidWeights.rows.map((row) => `${row.employee_no}（${Number(row.totalWeight).toFixed(2)}）`).join("、")}`);
     const indicatorRows = await client.query(`select a.id as "assessmentId", a.employee_no as "employeeNo", n.node_code as "nodeCode",
       n.parent_id, parent.node_code as "parentCode", n.name, n.max_score as "maxScore"
       from assessments a left join indicator_nodes n on n.assessment_id=a.id
@@ -225,10 +237,10 @@ export async function approveAssessment(actor: Actor, assessmentId: string, expe
     if (assessment.status !== "SUBMITTED") throw new HttpError(409, "NOT_SUBMITTED", "只能通过待预审考核单");
     if (assessment.cycleStatus !== "ACTIVE") throw new HttpError(409, "CYCLE_LOCKED", "考核周期发布后才可审核");
     assertVersion(assessment.version, expectedVersion);
-    const assignments = await client.query("select scorer_employee_no as \"scorerEmployeeNo\" from scorer_assignments where cycle_id=$1 and employee_no=$2 and status='ACTIVE' order by scorer_employee_no for update", [assessment.cycleId, assessment.employeeNo]);
+    const assignments = await client.query("select scorer_employee_no as \"scorerEmployeeNo\", weight from scorer_assignments where cycle_id=$1 and employee_no=$2 and status='ACTIVE' order by scorer_employee_no for update", [assessment.cycleId, assessment.employeeNo]);
     if (!assignments.rows.length) throw new HttpError(422, "NO_SCORERS", "请先配置打分人");
     for (const row of assignments.rows) {
-      await client.query("insert into score_tasks (id,assessment_id,scorer_employee_no) values ($1,$2,$3)", [randomUUID(), assessmentId, row.scorerEmployeeNo]);
+      await client.query("insert into score_tasks (id,assessment_id,scorer_employee_no,weight) values ($1,$2,$3,$4)", [randomUUID(), assessmentId, row.scorerEmployeeNo, row.weight]);
     }
     await client.query("update assessments set status='SCORING', version=version+1, approved_at=now() where id=$1", [assessmentId]);
     await audit(client, actor, "APPROVE_SELF", "ASSESSMENT", assessmentId);
@@ -284,9 +296,9 @@ export async function submitScore(actor: Actor, taskId: string, expectedVersion:
     const total = Math.round(leaves.rows.reduce((sum, row) => sum + Number(row.score), 0) * 100) / 100;
     await client.query("update score_tasks set status='SUBMITTED', version=version+1, total_score=$2, submitted_at=now() where id=$1", [taskId, total]);
     await client.query("select id from assessments where id=$1 for update", [task.assessmentId]);
-    const all = await client.query("select status, total_score from score_tasks where assessment_id=$1", [task.assessmentId]);
+    const all = await client.query("select status, total_score, weight from score_tasks where assessment_id=$1", [task.assessmentId]);
     if (all.rows.every((row) => row.status === "SUBMITTED")) {
-      const finalScore = calculateFinalScore(all.rows.map((row) => Number(row.total_score)));
+      const finalScore = calculateWeightedFinalScore(all.rows.map((row) => ({ score: Number(row.total_score), weight: Number(row.weight) })));
       await client.query("update assessments set status='COMPLETED', final_score=$2, version=version+1, completed_at=now() where id=$1", [task.assessmentId, finalScore]);
     }
     await audit(client, actor, "SUBMIT_SCORE", "SCORE_TASK", taskId);

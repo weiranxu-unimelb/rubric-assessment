@@ -1,4 +1,5 @@
-import { pgTable, text, integer, boolean, numeric, timestamp, jsonb, primaryKey, unique, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, text, integer, boolean, numeric, timestamp, jsonb, primaryKey, unique, index, check } from "drizzle-orm/pg-core";
 
 export const companies = pgTable("companies", {
   id: text("id").primaryKey(),
@@ -106,8 +107,9 @@ export const scorerAssignments = pgTable("scorer_assignments", {
   cycleId: text("cycle_id").notNull().references(() => cycles.id),
   employeeNo: text("employee_no").notNull().references(() => employees.employeeNo),
   scorerEmployeeNo: text("scorer_employee_no").notNull().references(() => employees.employeeNo),
+  weight: numeric("weight", { precision: 5, scale: 2 }).notNull(),
   status: text("status").notNull().default("ACTIVE"),
-}, (table) => [unique("scorer_assignment_unique").on(table.cycleId, table.employeeNo, table.scorerEmployeeNo)]);
+}, (table) => [unique("scorer_assignment_unique").on(table.cycleId, table.employeeNo, table.scorerEmployeeNo), check("scorer_assignment_weight_range", sql`${table.weight} > 0 and ${table.weight} <= 100`)]);
 
 export const scoreTasks = pgTable("score_tasks", {
   id: text("id").primaryKey(),
@@ -116,8 +118,9 @@ export const scoreTasks = pgTable("score_tasks", {
   status: text("status").notNull().default("PENDING"),
   version: integer("version").notNull().default(1),
   totalScore: numeric("total_score", { precision: 5, scale: 2 }),
+  weight: numeric("weight", { precision: 5, scale: 2 }).notNull(),
   submittedAt: timestamp("submitted_at", { withTimezone: true }),
-}, (table) => [unique("score_task_assessment_scorer_unique").on(table.assessmentId, table.scorerEmployeeNo), index("score_task_scorer_idx").on(table.scorerEmployeeNo, table.status)]);
+}, (table) => [unique("score_task_assessment_scorer_unique").on(table.assessmentId, table.scorerEmployeeNo), index("score_task_scorer_idx").on(table.scorerEmployeeNo, table.status), check("score_task_weight_range", sql`${table.weight} > 0 and ${table.weight} <= 100`)]);
 
 export const scoreItems = pgTable("score_items", {
   taskId: text("task_id").notNull().references(() => scoreTasks.id),

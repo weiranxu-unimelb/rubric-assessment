@@ -55,3 +55,35 @@ export function calculateFinalScore(scores: number[]): number {
   }
   return Math.round((scores.reduce((sum, score) => sum + score, 0) / scores.length) * 100) / 100;
 }
+
+const WEIGHT_SCALE = 100;
+
+function formatWeight(weight: number) {
+  return (Math.round(weight * WEIGHT_SCALE) / WEIGHT_SCALE).toFixed(2);
+}
+
+export function distributeScorerWeights(count: number): number[] {
+  if (!Number.isInteger(count) || count < 1) throw new Error("打分人数量必须至少为 1");
+  const base = Math.floor(10_000 / count);
+  const remainder = 10_000 - base * count;
+  return Array.from({ length: count }, (_, index) => (base + (index < remainder ? 1 : 0)) / WEIGHT_SCALE);
+}
+
+export function validateScorerWeights(weights: number[]): string[] {
+  if (weights.length === 0) return ["至少需要一位打分人"];
+  if (weights.some((weight) => !Number.isFinite(weight) || Math.abs(weight * WEIGHT_SCALE - Math.round(weight * WEIGHT_SCALE)) > 0.000001)) {
+    return ["打分人权重最多保留两位小数"];
+  }
+  if (weights.some((weight) => weight <= 0 || weight > 100)) return ["每位打分人的权重必须大于 0 且不超过 100"];
+  const total = weights.reduce((sum, weight) => sum + Math.round(weight * WEIGHT_SCALE), 0) / WEIGHT_SCALE;
+  return total === 100 ? [] : [`打分人权重合计必须为 100.00，当前为 ${formatWeight(total)}`];
+}
+
+export function calculateWeightedFinalScore(scores: { score: number; weight: number }[]): number {
+  if (scores.length === 0 || scores.some(({ score }) => !Number.isFinite(score) || score < 0 || score > 100)) {
+    throw new Error("有效打分人分数不能为空，且必须在 0–100 之间");
+  }
+  const errors = validateScorerWeights(scores.map(({ weight }) => weight));
+  if (errors.length) throw new Error(errors[0]);
+  return Math.round(scores.reduce((sum, { score, weight }) => sum + score * weight / 100, 0) * 100) / 100;
+}

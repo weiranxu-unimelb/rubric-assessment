@@ -71,6 +71,13 @@
       "when": 1789739000000,
       "tag": "0009_template_company_scope",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1790004000000,
+      "tag": "0010_scorer_weights",
+      "breakpoints": true
     }
   ]
 }

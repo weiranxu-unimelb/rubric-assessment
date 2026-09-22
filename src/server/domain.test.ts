@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { calculateFinalScore, validateIndicatorTree } from "./domain";
+import { calculateFinalScore, calculateWeightedFinalScore, distributeScorerWeights, validateIndicatorTree, validateScorerWeights } from "./domain";
 
 describe("validateIndicatorTree", () => {
   it("accepts a nested 100-point tree", () => {
@@ -39,5 +39,27 @@ describe("calculateFinalScore", () => {
   it("rejects missing or invalid scores", () => {
     expect(() => calculateFinalScore([])).toThrow();
     expect(() => calculateFinalScore([101])).toThrow();
+  });
+});
+
+describe("scorer weights", () => {
+  it("distributes an exact 100 percent across multiple scorers", () => {
+    expect(distributeScorerWeights(1)).toEqual([100]);
+    expect(distributeScorerWeights(3)).toEqual([33.34, 33.33, 33.33]);
+  });
+
+  it("requires positive two-decimal weights totaling exactly 100", () => {
+    expect(validateScorerWeights([50, 30, 20])).toEqual([]);
+    expect(validateScorerWeights([33.33, 33.33, 33.33])).toContain("打分人权重合计必须为 100.00，当前为 99.99");
+    expect(validateScorerWeights([100.001])).toContain("打分人权重最多保留两位小数");
+    expect(validateScorerWeights([0, 100])).toContain("每位打分人的权重必须大于 0 且不超过 100");
+  });
+
+  it("calculates the final score from frozen scorer weights", () => {
+    expect(calculateWeightedFinalScore([
+      { score: 90, weight: 50 },
+      { score: 80, weight: 30 },
+      { score: 95, weight: 20 },
+    ])).toBe(88);
   });
 });
