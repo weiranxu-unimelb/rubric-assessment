@@ -24,15 +24,16 @@ export async function loadState(actor: Actor) {
 
   let adminData: Record<string, unknown> | null = null;
   if (scope.length > 0 || actor.isSuperAdmin) {
-    const [employees, assessments, nodes, assignments, progress, templateAssignments] = await Promise.all([
-      pool.query("select employee_no as \"employeeNo\", subsidiary_id as \"subsidiaryId\", name, department, position, phone, status, is_super_admin as \"isSuperAdmin\" from employees where subsidiary_id=any($1::text[]) order by department, name, employee_no", [scope]),
+    const [employees, assessments, nodes, assignments, progress, templateAssignments, departmentPresets] = await Promise.all([
+      pool.query("select employee_no as \"employeeNo\", subsidiary_id as \"subsidiaryId\", name, department, position, rank, phone, status, is_super_admin as \"isSuperAdmin\" from employees where subsidiary_id=any($1::text[]) order by department, name, employee_no", [scope]),
       pool.query("select a.id, a.cycle_id as \"cycleId\", a.employee_no as \"employeeNo\", e.name as \"employeeName\", e.subsidiary_id as \"subsidiaryId\", a.status, a.version, a.submitted_at as \"submittedAt\" from assessments a join employees e on e.employee_no=a.employee_no where e.subsidiary_id=any($1::text[]) order by e.name", [scope]),
       pool.query("select n.id, n.assessment_id as \"assessmentId\", n.parent_id as \"parentId\", n.node_code as \"nodeCode\", n.name, n.description, n.scoring_rule as \"scoringRule\", n.max_score as \"maxScore\", n.sort_order as \"sortOrder\", n.self_content as \"selfContent\", n.admin_feedback as \"adminFeedback\" from indicator_nodes n join assessments a on a.id=n.assessment_id join employees e on e.employee_no=a.employee_no where e.subsidiary_id=any($1::text[]) order by n.sort_order,n.node_code", [scope]),
       pool.query("select sa.id, sa.cycle_id as \"cycleId\", sa.employee_no as \"employeeNo\", sa.scorer_employee_no as \"scorerEmployeeNo\", sa.weight, s.name as \"scorerName\" from scorer_assignments sa join employees e on e.employee_no=sa.employee_no join employees s on s.employee_no=sa.scorer_employee_no where e.subsidiary_id=any($1::text[]) and sa.status='ACTIVE' order by e.name, s.name", [scope]),
       pool.query("select t.id, a.id as \"assessmentId\", a.cycle_id as \"cycleId\", a.employee_no as \"employeeNo\", t.scorer_employee_no as \"scorerEmployeeNo\", s.name as \"scorerName\", t.status from score_tasks t join assessments a on a.id=t.assessment_id join employees e on e.employee_no=a.employee_no join employees s on s.employee_no=t.scorer_employee_no where e.subsidiary_id=any($1::text[]) order by e.name, s.name", [scope]),
       pool.query("select ta.cycle_id as \"cycleId\",ta.employee_no as \"employeeNo\",ta.template_id as \"templateId\",t.name as \"templateName\" from template_assignments ta join employees e on e.employee_no=ta.employee_no join indicator_templates t on t.id=ta.template_id where e.subsidiary_id=any($1::text[]) order by e.name,t.name", [scope]),
+      pool.query("select subsidiary_id as \"subsidiaryId\", department, general_manager_factor as \"generalManagerFactor\", deputy_general_manager_factor as \"deputyGeneralManagerFactor\", employee_factor as \"employeeFactor\" from department_scorer_presets where subsidiary_id=any($1::text[]) order by department", [scope]),
     ]);
-    adminData = { employees: employees.rows, assessments: assessments.rows, nodes: nodes.rows, assignments: assignments.rows, progress: progress.rows, templateAssignments: templateAssignments.rows };
+    adminData = { employees: employees.rows, assessments: assessments.rows, nodes: nodes.rows, assignments: assignments.rows, progress: progress.rows, templateAssignments: templateAssignments.rows, departmentPresets: departmentPresets.rows };
   }
 
   let superData: Record<string, unknown> | null = null;

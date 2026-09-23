@@ -1,5 +1,7 @@
 import { sql } from "drizzle-orm";
-import { pgTable, text, integer, boolean, numeric, timestamp, jsonb, primaryKey, unique, index, check } from "drizzle-orm/pg-core";
+import { pgTable, pgEnum, text, integer, boolean, numeric, timestamp, jsonb, primaryKey, unique, index, check } from "drizzle-orm/pg-core";
+
+export const employeeRank = pgEnum("employee_rank", ["EMPLOYEE", "DEPUTY_GENERAL_MANAGER", "GENERAL_MANAGER"]);
 
 export const companies = pgTable("companies", {
   id: text("id").primaryKey(),
@@ -19,12 +21,26 @@ export const employees = pgTable("employees", {
   name: text("name").notNull(),
   department: text("department").notNull().default(""),
   position: text("position"),
+  rank: employeeRank("rank").notNull().default("EMPLOYEE"),
   phone: text("phone"),
   passwordHash: text("password_hash").notNull(),
   isSuperAdmin: boolean("is_super_admin").notNull().default(false),
   status: text("status").notNull().default("ACTIVE"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+export const departmentScorerPresets = pgTable("department_scorer_presets", {
+  subsidiaryId: text("subsidiary_id").notNull().references(() => subsidiaries.id),
+  department: text("department").notNull(),
+  generalManagerFactor: integer("general_manager_factor").notNull().default(3),
+  deputyGeneralManagerFactor: integer("deputy_general_manager_factor").notNull().default(2),
+  employeeFactor: integer("employee_factor").notNull().default(1),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.subsidiaryId, table.department] }),
+  check("department_scorer_preset_name", sql`length(btrim(${table.department})) > 0`),
+  check("department_scorer_preset_factors", sql`${table.generalManagerFactor} between 1 and 100 and ${table.deputyGeneralManagerFactor} between 1 and 100 and ${table.employeeFactor} between 1 and 100`),
+]);
 
 export const adminScopes = pgTable("admin_scopes", {
   adminEmployeeNo: text("admin_employee_no").notNull().references(() => employees.employeeNo),

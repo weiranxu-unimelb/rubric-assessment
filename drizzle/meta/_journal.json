@@ -78,6 +78,13 @@
       "when": 1790004000000,
       "tag": "0010_scorer_weights",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1790121600000,
+      "tag": "0011_department_rank_presets",
+      "breakpoints": true
     }
   ]
 }

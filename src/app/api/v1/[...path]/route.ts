@@ -10,6 +10,7 @@ import { isAllowedOrigin } from "@/server/origin";
 import { approveAssessment, configureAssessment, HttpError, publishCycle, returnAssessment, saveOwnIndicatorTree, saveScore, saveSelf, submitScore, submitSelf } from "@/server/workflows";
 import { buildIndicatorNodes, validateIndicatorHierarchy, type IndicatorGroupDraft } from "@/lib/indicator-hierarchy";
 import { distributeScorerWeights, validateScorerWeights } from "@/server/domain";
+import { calculateRankWeights, EMPLOYEE_RANKS, rankLabels, type EmployeeRank, type RankFactors } from "@/lib/scorer-weights";
 
 export const runtime = "nodejs";
 const text = z.string().trim().min(1).max(200);
@@ -22,9 +23,12 @@ const newPassword = z.string().min(10).max(128).regex(/^(?=.*[A-Za-z])(?=.*\d).+
 const score = z.number().finite().min(0).max(100);
 const scorerWeight = z.number().finite().gt(0).max(100).refine((value) => Math.abs(value * 100 - Math.round(value * 100)) < 0.000001, "权重最多保留两位小数");
 const scorerAssignmentInput = z.object({ scorerEmployeeNo: employeeNo, weight: scorerWeight });
+const employeeRank = z.enum(EMPLOYEE_RANKS);
+const factor = z.number().int().min(1).max(100);
+const departmentPresetInput = z.object({ subsidiaryId: id, department: text, generalManagerFactor: factor, deputyGeneralManagerFactor: factor, employeeFactor: factor });
 const node = z.object({ nodeCode: text, parentCode: text.nullable(), name: text, description: z.string().max(2000).default(""), scoringRule: z.string().max(2000).default(""), maxScore: score, sortOrder: z.number().int().default(0) });
 const draftNode = z.object({ nodeCode: text, parentCode: text.nullable(), name: z.string().max(200).default(""), description: z.string().max(2000).default(""), scoringRule: z.string().max(2000).default(""), maxScore: score, sortOrder: z.number().int().default(0) });
-const employeeImportRow = z.object({ employeeNo, name: text, subsidiaryName: text, department: text, position: z.string().max(200), phone: z.string().max(40), initialPassword: newPassword });
+const employeeImportRow = z.object({ employeeNo, name: text, subsidiaryName: text, department: text, position: z.string().max(200), phone: z.string().max(40), initialPassword: newPassword, rank: employeeRank });
 const sensitiveConfirmation = "我知道是敏感操作，确认删除";
 const templateColumn = z.object({ id: z.string().trim().min(1).max(80), label: z.string().trim().min(1).max(80), type: z.enum(["TEXT", "TEXTAREA", "NUMBER", "DATE"]), required: z.boolean() });
 const templateRow = z.object({ id: z.string().trim().min(1).max(80), label: z.string().trim().max(120).default("") });
@@ -57,12 +61,31 @@ function assessmentNodesFromTemplate(layout: z.infer<typeof templateLayout>) {
 }
 
 function normalizeScorerAssignments(scorerEmployeeNos: string[], configured?: z.infer<typeof scorerAssignmentInput>[]) {
-  const assignments = configured ?? scorerEmployeeNos.map((scorerEmployeeNo, index) => ({ scorerEmployeeNo, weight: distributeScorerWeights(scorerEmployeeNos.length)[index] }));
+  const defaults = scorerEmployeeNos.length ? distributeScorerWeights(scorerEmployeeNos.length) : [];
+  const assignments = configured ?? scorerEmployeeNos.map((scorerEmployeeNo, index) => ({ scorerEmployeeNo, weight: defaults[index] }));
   const assignedNos = assignments.map((assignment) => assignment.scorerEmployeeNo);
   if (!assignments.length || new Set(assignedNos).size !== assignedNos.length) throw new HttpError(422, "INVALID_SCORERS", "至少需要一位不重复的打分人");
   const errors = validateScorerWeights(assignments.map((assignment) => assignment.weight));
   if (errors.length) throw new HttpError(422, "INVALID_SCORER_WEIGHTS", errors.join("；"));
   return assignments;
+}
+
+function factorsFromPreset(row: { generalManagerFactor: number; deputyGeneralManagerFactor: number; employeeFactor: number }): RankFactors {
+  return { GENERAL_MANAGER: Number(row.generalManagerFactor), DEPUTY_GENERAL_MANAGER: Number(row.deputyGeneralManagerFactor), EMPLOYEE: Number(row.employeeFactor) };
+}
+
+async function calculateAutomaticAssignments(client: PoolClient, target: { subsidiaryId: string; department: string }, scorerEmployeeNos: string[], presetRequired: boolean) {
+  const preset = await client.query(`select general_manager_factor as "generalManagerFactor", deputy_general_manager_factor as "deputyGeneralManagerFactor", employee_factor as "employeeFactor"
+    from department_scorer_presets where subsidiary_id=$1 and department=$2 for share`, [target.subsidiaryId, target.department]);
+  if (!preset.rows.length) {
+    if (presetRequired) throw new HttpError(422, "SCORER_PRESET_REQUIRED", "该员工所在部门尚未配置职级权重预设");
+    return normalizeScorerAssignments(scorerEmployeeNos);
+  }
+  const people = await client.query("select employee_no as \"employeeNo\",rank from employees where employee_no=any($1::text[]) and status='ACTIVE' for share", [scorerEmployeeNos]);
+  if (people.rows.length !== scorerEmployeeNos.length) throw new HttpError(422, "INVALID_SCORERS", "所选打分人不存在或已停用");
+  const byNo = new Map(people.rows.map((person) => [person.employeeNo as string, person.rank as EmployeeRank]));
+  const weights = calculateRankWeights(scorerEmployeeNos.map((employeeNo) => ({ employeeNo, rank: byNo.get(employeeNo)! })), factorsFromPreset(preset.rows[0]));
+  return scorerEmployeeNos.map((scorerEmployeeNo, index) => ({ scorerEmployeeNo, weight: weights[index] }));
 }
 
 function response(data: unknown, status = 200) { return NextResponse.json(data, { status }); }
@@ -99,11 +122,11 @@ async function mayManageCompany(actor: Actor, companyId: string) {
   return result.rows.length > 0;
 }
 async function createEmployee(actor: Actor, value: unknown) {
-  const data = z.object({ employeeNo, subsidiaryId: id, name: text, department: text, position: z.string().max(200).default(""), phone: z.string().max(40).default(""), initialPassword: newPassword }).parse(value);
+  const data = z.object({ employeeNo, subsidiaryId: id, name: text, department: text, position: z.string().max(200).default(""), rank: employeeRank.default("EMPLOYEE"), phone: z.string().max(40).default(""), initialPassword: newPassword }).parse(value);
   if (!mayAdmin(actor, data.subsidiaryId)) throw new HttpError(403, "FORBIDDEN", "无权管理该子公司");
   await companyForSubsidiary(data.subsidiaryId);
   const passwordHash = await hashPassword(data.initialPassword);
-  await pool.query("insert into employees (employee_no,subsidiary_id,name,department,position,phone,password_hash) values ($1,$2,$3,$4,$5,$6,$7)", [data.employeeNo, data.subsidiaryId, data.name, data.department, data.position, data.phone, passwordHash]);
+  await pool.query("insert into employees (employee_no,subsidiary_id,name,department,position,rank,phone,password_hash) values ($1,$2,$3,$4,$5,$6,$7,$8)", [data.employeeNo, data.subsidiaryId, data.name, data.department, data.position, data.rank, data.phone, passwordHash]);
   return { employeeNo: data.employeeNo };
 }
 async function deleteAssessmentsForEmployees(client: PoolClient, employeeNos: string[]) {
@@ -161,7 +184,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ path: strin
     if (path === "state") return response(await loadState(actor));
     if (path === "templates/employees" || path === "templates/indicators" || path === "templates/scorers") {
       adminRequired(actor);
-      if (path === "templates/employees") return excelResponse([["工号", "姓名", "公司名称", "部门", "职位", "手机号", "初始密码"], ["E1001", "张三", "请填公司名称", "人力资源部", "人事专员", "", "至少10位密码"]], "员工导入模板");
+      if (path === "templates/employees") return excelResponse([["工号", "姓名", "公司名称", "部门", "职位", "手机号", "初始密码", "职级"], ["E1001", "张三", "请填公司名称", "人力资源部", "人事专员", "", "至少10位密码", "员工"]], "员工导入模板");
       if (path === "templates/indicators") return excelResponse([["一级指标", "一级考核内容", "一级计分规则", "一级分值", "二级指标", "二级考核内容", "二级计分规则", "二级分值"], ["人力资源基础业务规范开展", "完成基础人力资源工作", "按完成质量与时效评分", 25, "", "", "", ""], ["人才引进及任务服务支持", "完成招聘及服务支持", "按任务完成情况评分", 30, "", "", "", ""], ["岗位绩效考核协同及业务能力提升", "协同完成考核工作", "按协同质量评分", 45, "招聘计划执行", "完成招聘计划", "按招聘达成率评分", 25], ["岗位绩效考核协同及业务能力提升", "", "", 45, "考核协同", "完成绩效协同", "按协同及时性评分", 20]], "指标导入模板");
       return excelResponse([["被打分人工号", "打分人工号", "权重（%）"], ["E1001", "E1002", 60], ["E1001", "E1003", 40]], "打分人关系模板");
     }
@@ -169,8 +192,8 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ path: strin
       adminRequired(actor);
       const scope = actor.isSuperAdmin ? null : actor.adminSubsidiaryIds;
       if (path === "export/employees") {
-        const result = await pool.query(`select e.employee_no,e.name,s.name as subsidiary_name,e.department,e.position,e.phone,e.status from employees e join subsidiaries s on s.id=e.subsidiary_id where $1::text[] is null or e.subsidiary_id=any($1::text[]) order by s.name,e.department,e.name`, [scope]);
-        return excelResponse([["工号", "姓名", "公司", "部门", "职位", "手机号", "状态"], ...result.rows.map((r) => [r.employee_no, r.name, r.subsidiary_name, r.department, r.position, r.phone, r.status])], "员工名单");
+        const result = await pool.query(`select e.employee_no,e.name,s.name as subsidiary_name,e.department,e.position,e.rank,e.phone,e.status from employees e join subsidiaries s on s.id=e.subsidiary_id where $1::text[] is null or e.subsidiary_id=any($1::text[]) order by s.name,e.department,e.name`, [scope]);
+        return excelResponse([["工号", "姓名", "公司", "部门", "职位", "手机号", "状态", "职级"], ...result.rows.map((r) => [r.employee_no, r.name, r.subsidiary_name, r.department, r.position, r.phone, r.status, rankLabels[r.rank as EmployeeRank]])], "员工名单");
       }
       const cycleId = id.parse(req.nextUrl.searchParams.get("cycleId"));
       if (path === "export/scorers") {
@@ -256,6 +279,25 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
       return response({ id: newId }, 201);
     }
     if (path === "employees") { adminRequired(actor); return response(await createEmployee(actor, await body(req)), 201); }
+    if (path === "department-scorer-presets") {
+      adminRequired(actor);
+      const data = departmentPresetInput.parse(await body(req));
+      if (!mayAdmin(actor, data.subsidiaryId)) throw new HttpError(403, "FORBIDDEN", "无权配置该子公司的部门预设");
+      const departmentExists = await pool.query("select 1 from employees where subsidiary_id=$1 and department=$2 limit 1", [data.subsidiaryId, data.department]);
+      if (!departmentExists.rows.length) throw new HttpError(422, "DEPARTMENT_NOT_FOUND", "请先在该子公司设置员工部门");
+      const client = await pool.connect();
+      try {
+        await client.query("begin");
+        await client.query(`insert into department_scorer_presets (subsidiary_id,department,general_manager_factor,deputy_general_manager_factor,employee_factor)
+          values ($1,$2,$3,$4,$5) on conflict (subsidiary_id,department) do update set general_manager_factor=excluded.general_manager_factor,
+          deputy_general_manager_factor=excluded.deputy_general_manager_factor,employee_factor=excluded.employee_factor,updated_at=now()`,
+        [data.subsidiaryId, data.department, data.generalManagerFactor, data.deputyGeneralManagerFactor, data.employeeFactor]);
+        await client.query("insert into audit_logs (id,actor_employee_no,action,entity_type,entity_id,detail) values ($1,$2,'UPSERT_SCORER_PRESET','DEPARTMENT',$3,$4)",
+          [randomUUID(), actor.employeeNo, `${data.subsidiaryId}:${data.department}`, JSON.stringify(data)]);
+        await client.query("commit");
+      } catch (error) { await client.query("rollback"); throw error; } finally { client.release(); }
+      return response({ ok: true });
+    }
     if (path === "templates") {
       adminRequired(actor);
       const data = z.object({ name: text, layout: templateLayout, companyId: id.optional() }).parse(await body(req));
@@ -320,19 +362,24 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
     }
     if (path === "scorer-assignments") {
       adminRequired(actor);
-      const data = z.object({ cycleId: id, employeeNo, scorerEmployeeNos: z.array(employeeNo).min(1).max(20).optional(), scorerAssignments: z.array(scorerAssignmentInput).min(1).max(20).optional() }).parse(await body(req));
-      const assignments = normalizeScorerAssignments(data.scorerEmployeeNos ?? data.scorerAssignments?.map((item) => item.scorerEmployeeNo) ?? [], data.scorerAssignments);
-      const scorerEmployeeNos = assignments.map((assignment) => assignment.scorerEmployeeNo);
-      if (scorerEmployeeNos.includes(data.employeeNo)) throw new HttpError(422, "INVALID_SCORERS", "打分人不可重复或为本人");
-      const target = await pool.query("select e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=$2 and e.status='ACTIVE' and exists (select 1 from assessments a where a.cycle_id=$1 and a.employee_no=e.employee_no and a.status='DRAFT')", [data.cycleId, data.employeeNo]);
-      if (!target.rows[0] || !mayAdmin(actor, target.rows[0].subsidiaryId)) throw new HttpError(422, "ASSESSMENT_REQUIRED", "请先为该员工导入指标，或匹配指标模板");
-      const scorerRows = await pool.query("select e.employee_no as \"employeeNo\",e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=any($1::text[]) and e.status='ACTIVE'", [scorerEmployeeNos]);
-      if (scorerRows.rows.length !== scorerEmployeeNos.length || scorerRows.rows.some((scorer) => scorer.companyId !== target.rows[0].companyId || !mayAdmin(actor, scorer.subsidiaryId))) throw new HttpError(422, "INVALID_SCORERS", "打分人必须是在职员工，并且属于同一企业及管理员授权范围");
+      const data = z.object({ cycleId: id, employeeNo, scorerEmployeeNos: z.array(employeeNo).min(1).max(20).optional(), scorerAssignments: z.array(scorerAssignmentInput).min(1).max(20).optional(), weightMode: z.enum(["DEPARTMENT_PRESET"]).optional() }).parse(await body(req));
+      if (data.scorerEmployeeNos && data.scorerAssignments) throw new HttpError(422, "INVALID_SCORERS", "请选择打分人或提交手动权重，不可同时使用两种配置");
+      const scorerEmployeeNos = data.scorerEmployeeNos ?? data.scorerAssignments?.map((item) => item.scorerEmployeeNo) ?? [];
+      if (!scorerEmployeeNos.length || new Set(scorerEmployeeNos).size !== scorerEmployeeNos.length || scorerEmployeeNos.includes(data.employeeNo)) throw new HttpError(422, "INVALID_SCORERS", "打分人不可重复或为本人");
+      if (data.weightMode && data.scorerAssignments) throw new HttpError(422, "INVALID_SCORER_WEIGHTS", "应用部门预设时不可同时提交手动权重");
+      const manualAssignments = data.scorerAssignments ? normalizeScorerAssignments(scorerEmployeeNos, data.scorerAssignments) : null;
       const client = await pool.connect();
       try {
         await client.query("begin");
-        const locked = await client.query("select a.id from assessments a join cycles c on c.id=a.cycle_id where a.cycle_id=$1 and a.employee_no=$2 and a.status='DRAFT' and c.status='DRAFT' for update of a,c", [data.cycleId, data.employeeNo]);
+        const cycle = await client.query("select id from cycles where id=$1 and status='DRAFT' for update", [data.cycleId]);
+        if (!cycle.rows.length) throw new HttpError(409, "SCORER_ASSIGNMENTS_LOCKED", "仅草稿周期可调整打分关系");
+        const target = await client.query("select e.subsidiary_id as \"subsidiaryId\",e.department,s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=$1 and e.status='ACTIVE' for share of e", [data.employeeNo]);
+        if (!target.rows.length || !mayAdmin(actor, target.rows[0].subsidiaryId)) throw new HttpError(422, "ASSESSMENT_REQUIRED", "请先为该员工导入指标，或匹配指标模板");
+        const scorerRows = await client.query("select e.employee_no as \"employeeNo\",e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=any($1::text[]) and e.status='ACTIVE' for share of e", [scorerEmployeeNos]);
+        if (scorerRows.rows.length !== scorerEmployeeNos.length || scorerRows.rows.some((scorer) => scorer.companyId !== target.rows[0].companyId || !mayAdmin(actor, scorer.subsidiaryId))) throw new HttpError(422, "INVALID_SCORERS", "打分人必须是在职员工，并且属于同一企业及管理员授权范围");
+        const locked = await client.query("select id from assessments where cycle_id=$1 and employee_no=$2 and status='DRAFT' for update", [data.cycleId, data.employeeNo]);
         if (!locked.rows.length) throw new HttpError(409, "SCORER_ASSIGNMENTS_LOCKED", "仅草稿周期且员工尚未填报时可调整打分关系");
+        const assignments = manualAssignments ?? await calculateAutomaticAssignments(client, target.rows[0], scorerEmployeeNos, data.weightMode === "DEPARTMENT_PRESET");
         await client.query("delete from scorer_assignments where cycle_id=$1 and employee_no=$2", [data.cycleId, data.employeeNo]);
         for (const assignment of assignments) await client.query("insert into scorer_assignments (id,cycle_id,employee_no,scorer_employee_no,weight) values ($1,$2,$3,$4,$5)", [randomUUID(), data.cycleId, data.employeeNo, assignment.scorerEmployeeNo, assignment.weight]);
         await client.query("commit");
@@ -369,7 +416,8 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
         const row = sheet.getRow(rowIndex);
         const cell = (n: number) => String(row.getCell(n).text ?? "").trim();
         if (!cell(1)) continue;
-        const parsed = employeeImportRow.safeParse({ employeeNo: cell(1), name: cell(2), subsidiaryName: cell(3), department: cell(4), position: cell(5), phone: cell(6), initialPassword: cell(7) });
+        const parsedRank = EMPLOYEE_RANKS.find((rank) => rank === cell(8) || rankLabels[rank] === cell(8)) ?? (cell(8) ? null : "EMPLOYEE");
+        const parsed = employeeImportRow.safeParse({ employeeNo: cell(1), name: cell(2), subsidiaryName: cell(3), department: cell(4), position: cell(5), phone: cell(6), initialPassword: cell(7), rank: parsedRank });
         if (!parsed.success) { errors.push(`第 ${rowIndex} 行：${parsed.error.issues.map((issue) => issue.path.join(".")).join("、")}无效`); continue; }
         if (seen.has(parsed.data.employeeNo)) { errors.push(`第 ${rowIndex} 行：工号在文件中重复`); continue; }
         seen.add(parsed.data.employeeNo);
@@ -390,7 +438,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
         await client.query("begin");
         for (let i = 0; i < rows.length; i++) {
           const row = rows[i];
-          await client.query("insert into employees (employee_no,subsidiary_id,name,department,position,phone,password_hash) values ($1,$2,$3,$4,$5,$6,$7)", [row.employeeNo, row.subsidiaryId, row.name, row.department, row.position, row.phone, hashes[i]]);
+          await client.query("insert into employees (employee_no,subsidiary_id,name,department,position,rank,phone,password_hash) values ($1,$2,$3,$4,$5,$6,$7,$8)", [row.employeeNo, row.subsidiaryId, row.name, row.department, row.position, row.rank, row.phone, hashes[i]]);
         }
         await client.query("commit");
       } catch (error) { await client.query("rollback"); throw error; }
@@ -465,23 +513,30 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ path: stri
       if (!pairs.length && !errors.length) errors.push("文件中没有有效数据行");
       const pairsByEmployee = new Map<string, typeof pairs>();
       for (const pair of pairs) pairsByEmployee.set(pair.employeeNo, [...(pairsByEmployee.get(pair.employeeNo) ?? []), pair]);
+      const employeeNos = [...new Set(pairs.flatMap((p) => [p.employeeNo, p.scorerNo]))];
+      const people = await pool.query(`select e.employee_no,e.subsidiary_id,e.department,e.rank,s.company_id,e.status from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=any($1::text[])`, [employeeNos]);
+      const byNo = new Map(people.rows.map((p) => [p.employee_no as string, p]));
+      const presets = await pool.query(`select subsidiary_id,department,general_manager_factor as "generalManagerFactor",deputy_general_manager_factor as "deputyGeneralManagerFactor",employee_factor as "employeeFactor" from department_scorer_presets where subsidiary_id=any($1::text[])`, [[...new Set(people.rows.map((p) => p.subsidiary_id as string))]]);
+      const presetByDepartment = new Map(presets.rows.map((row) => [`${row.subsidiary_id}:${row.department}`, row]));
       for (const [targetNo, targetPairs] of pairsByEmployee) {
         const explicitWeights = targetPairs.filter((pair) => pair.weight !== null);
         if (explicitWeights.length && explicitWeights.length !== targetPairs.length) {
-          errors.push(`${targetNo}：同一员工的打分权重需全部填写，或全部留空后由系统均分`);
+          errors.push(`${targetNo}：同一员工的打分权重需全部填写，或全部留空后自动计算`);
           continue;
         }
-        const weights = explicitWeights.length ? targetPairs.map((pair) => pair.weight!) : distributeScorerWeights(targetPairs.length);
+        const target = byNo.get(targetNo);
+        const preset = target ? presetByDepartment.get(`${target.subsidiary_id}:${target.department}`) : null;
+        const canCalculate = targetPairs.every((pair) => byNo.has(pair.scorerNo));
+        const weights = explicitWeights.length ? targetPairs.map((pair) => pair.weight!)
+          : preset && canCalculate ? calculateRankWeights(targetPairs.map((pair) => ({ employeeNo: pair.scorerNo, rank: byNo.get(pair.scorerNo).rank as EmployeeRank })), factorsFromPreset(preset))
+          : distributeScorerWeights(targetPairs.length);
         const weightErrors = validateScorerWeights(weights);
         if (weightErrors.length) { errors.push(`${targetNo}：${weightErrors.join("；")}`); continue; }
         targetPairs.forEach((pair, index) => { pair.weight = weights[index]; });
       }
-      const employeeNos = [...new Set(pairs.flatMap((p) => [p.employeeNo, p.scorerNo]))];
-      const people = await pool.query(`select e.employee_no,e.subsidiary_id,s.company_id,e.status from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=any($1::text[])`, [employeeNos]);
-      const byNo = new Map(people.rows.map((p) => [p.employee_no as string, p]));
       for (const pair of pairs) {
         const target = byNo.get(pair.employeeNo); const scorer = byNo.get(pair.scorerNo);
-        if (!target || !scorer || target.status !== "ACTIVE" || scorer.status !== "ACTIVE" || target.company_id !== cycle.rows[0].company_id || scorer.company_id !== cycle.rows[0].company_id || !mayAdmin(actor, target.subsidiary_id) || !mayAdmin(actor, scorer.subsidiary_id)) errors.push(`${pair.employeeNo} → ${pair.scorerNo}：人员不存在、已停用或超出授权范围`);
+        if (!target || !scorer || target.status !== "ACTIVE" || scorer.status !== "ACTIVE" || (cycle.rows[0].company_id && (target.company_id !== cycle.rows[0].company_id || scorer.company_id !== cycle.rows[0].company_id)) || target.company_id !== scorer.company_id || !mayAdmin(actor, target.subsidiary_id) || !mayAdmin(actor, scorer.subsidiary_id)) errors.push(`${pair.employeeNo} → ${pair.scorerNo}：人员不存在、已停用或超出授权范围`);
       }
       const targetNos = [...new Set(pairs.map((p) => p.employeeNo))];
       const assessments = await pool.query("select employee_no,status from assessments where cycle_id=$1 and employee_no=any($2::text[])", [cycleId, targetNos]);
@@ -592,7 +647,7 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ path: str
     if (employee) {
       adminRequired(actor);
       const targetEmployeeNo = employeeNo.parse(employee[1]);
-      const data = z.object({ subsidiaryId: id, department: text, position: z.string().max(200).default(""), phone: z.string().max(40).default(""), status: z.enum(["ACTIVE", "INACTIVE"]) }).parse(await body(req));
+      const data = z.object({ subsidiaryId: id, department: text, position: z.string().max(200).default(""), rank: employeeRank.optional(), phone: z.string().max(40).default(""), status: z.enum(["ACTIVE", "INACTIVE"]) }).parse(await body(req));
       const target = await pool.query("select e.subsidiary_id as \"subsidiaryId\",s.company_id as \"companyId\" from employees e join subsidiaries s on s.id=e.subsidiary_id where e.employee_no=$1", [targetEmployeeNo]);
       if (!target.rows[0]) throw new HttpError(404, "NOT_FOUND", "员工不存在");
       if (!mayAdmin(actor, target.rows[0].subsidiaryId) || !mayAdmin(actor, data.subsidiaryId)) throw new HttpError(403, "FORBIDDEN", "无权修改该员工或目标子公司");
@@ -602,7 +657,7 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ path: str
         const history = await pool.query("select 1 from assessments where employee_no=$1 limit 1", [targetEmployeeNo]);
         if (history.rows.length) throw new HttpError(409, "EMPLOYEE_HISTORY_EXISTS", "该员工存在历史考核记录，禁止跨企业调动");
       }
-      const result = await pool.query("update employees set subsidiary_id=$2,department=$3,position=$4,phone=$5,status=$6 where employee_no=$1 returning employee_no", [targetEmployeeNo, data.subsidiaryId, data.department, data.position, data.phone, data.status]);
+      const result = await pool.query("update employees set subsidiary_id=$2,department=$3,position=$4,phone=$5,status=$6,rank=coalesce($7::employee_rank,rank) where employee_no=$1 returning employee_no", [targetEmployeeNo, data.subsidiaryId, data.department, data.position, data.phone, data.status, data.rank ?? null]);
       if (!result.rows.length) throw new HttpError(404, "NOT_FOUND", "员工不存在");
       return response({ ok: true });
     }
@@ -679,6 +734,7 @@ export async function DELETE(req: NextRequest, ctx: { params: Promise<{ path: st
             await client.query("delete from employees where employee_no=any($1::text[])", [employeeNos]);
           }
           if (subsidiaryIds.length) await client.query("delete from admin_scopes where subsidiary_id=any($1::text[])", [subsidiaryIds]);
+          if (subsidiaryIds.length) await client.query("delete from department_scorer_presets where subsidiary_id=any($1::text[])", [subsidiaryIds]);
           if (entity === "subsidiaries") await client.query("delete from subsidiaries where id=$1", [targetId]);
           else {
             await deleteTemplatesForCompanies(client, [targetId]);

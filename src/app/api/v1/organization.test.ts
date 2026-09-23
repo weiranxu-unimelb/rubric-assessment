@@ -16,6 +16,7 @@ describe("subsidiary management", () => {
     query.mockReset();
     clientQuery.mockReset(); release.mockReset(); connect.mockClear();
     actor.isSuperAdmin = true;
+    actor.adminSubsidiaryIds = [];
     vi.stubEnv("APP_ORIGIN", "http://localhost:3000");
   });
 
@@ -201,6 +202,21 @@ describe("subsidiary management", () => {
 
     expect(response.status).toBe(422);
     expect(query).not.toHaveBeenCalled();
+  });
+
+  it("removes department presets before deleting their subsidiary", async () => {
+    clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
+    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ id: subsidiaryId, company_id: companyId }], rowCount: 1 });
+    const request = new NextRequest(`http://localhost:3000/api/v1/subsidiaries/${subsidiaryId}`, {
+      method: "DELETE", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
+      body: JSON.stringify({ confirmation: "我知道是敏感操作，确认删除" }),
+    });
+    const result = await DELETE(request, { params: Promise.resolve({ path: ["subsidiaries", subsidiaryId] }) });
+    expect(result.status).toBe(200);
+    const calls = clientQuery.mock.calls.map(([sql]) => String(sql));
+    expect(calls.indexOf("delete from department_scorer_presets where subsidiary_id=any($1::text[])"))
+      .toBeLessThan(calls.indexOf("delete from subsidiaries where id=$1"));
   });
 
   it("rejects a subsidiary name already used in the company", async () => {
@@ -449,10 +465,25 @@ describe("subsidiary management", () => {
     expect(query).not.toHaveBeenCalled();
   });
 
+  it("prevents an administrator from editing a department preset outside their subsidiary", async () => {
+    actor.isSuperAdmin = false;
+    actor.adminSubsidiaryIds = ["another-subsidiary"];
+    const request = new NextRequest("http://localhost:3000/api/v1/department-scorer-presets", {
+      method: "POST", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
+      body: JSON.stringify({ subsidiaryId, department: "人力部", generalManagerFactor: 3, deputyGeneralManagerFactor: 2, employeeFactor: 1 }),
+    });
+    const response = await POST(request, { params: Promise.resolve({ path: ["department-scorer-presets"] }) });
+    expect(response.status).toBe(403);
+    expect(query).not.toHaveBeenCalled();
+  });
+
   it("allows scorer setup after a structure template is matched, before indicator content is filled", async () => {
-    query.mockImplementationOnce((sql: string) => { expect(sql).toContain("assessments"); return Promise.resolve({ rows: [{ subsidiaryId, companyId }] }); }).mockResolvedValueOnce({ rows: [{ employeeNo: "E1002", subsidiaryId, companyId }] });
     clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
-    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 }).mockResolvedValueOnce({ rows: [{ id: "draft-assessment" }], rowCount: 1 });
+    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ id: companyId }], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ subsidiaryId, department: "人力部", companyId }], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ employeeNo: "E1002", subsidiaryId, companyId }], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ id: "draft-assessment" }], rowCount: 1 });
     const request = new NextRequest("http://localhost:3000/api/v1/scorer-assignments", {
       method: "POST", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
       body: JSON.stringify({ cycleId: companyId, employeeNo: "E1001", scorerEmployeeNos: ["E1002"] }),
@@ -463,5 +494,31 @@ describe("subsidiary management", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ok: true });
     expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining("insert into scorer_assignments"), expect.arrayContaining(["E1001", "E1002", 100]));
+  });
+
+  it("uses the target department rank preset to calculate each scorer's weight", async () => {
+    clientQuery.mockResolvedValue({ rows: [], rowCount: 1 });
+    clientQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ id: companyId }], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ subsidiaryId, department: "人力部", companyId }], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: ["GM", "DGM1", "DGM2", "EMP1", "EMP2", "EMP3"].map((employeeNo) => ({ employeeNo, subsidiaryId, companyId })), rowCount: 6 })
+      .mockResolvedValueOnce({ rows: [{ id: "draft-assessment" }], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ generalManagerFactor: 3, deputyGeneralManagerFactor: 2, employeeFactor: 1 }], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [
+        { employeeNo: "GM", rank: "GENERAL_MANAGER" },
+        { employeeNo: "DGM1", rank: "DEPUTY_GENERAL_MANAGER" },
+        { employeeNo: "DGM2", rank: "DEPUTY_GENERAL_MANAGER" },
+        { employeeNo: "EMP1", rank: "EMPLOYEE" },
+        { employeeNo: "EMP2", rank: "EMPLOYEE" },
+        { employeeNo: "EMP3", rank: "EMPLOYEE" },
+      ], rowCount: 6 });
+    const request = new NextRequest("http://localhost:3000/api/v1/scorer-assignments", {
+      method: "POST", headers: { origin: "http://localhost:3000", "content-type": "application/json" },
+      body: JSON.stringify({ cycleId: companyId, employeeNo: "E1001", weightMode: "DEPARTMENT_PRESET", scorerEmployeeNos: ["GM", "DGM1", "DGM2", "EMP1", "EMP2", "EMP3"] }),
+    });
+    const response = await POST(request, { params: Promise.resolve({ path: ["scorer-assignments"] }) });
+    expect(response.status).toBe(200);
+    const inserts = clientQuery.mock.calls.filter(([sql]) => typeof sql === "string" && sql.includes("insert into scorer_assignments"));
+    expect(inserts.map(([, args]) => args?.[4])).toEqual([30, 20, 20, 10, 10, 10]);
   });
 });
